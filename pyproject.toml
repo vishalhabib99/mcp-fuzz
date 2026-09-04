@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mcp-fuzz"
+version = "0.1.0"
+description = "Runtime behavioral testing for MCP servers: calls every tool with schema-derived inputs and checks whether it actually behaves the way its description and schema claim."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.0",
+]
+
+[project.scripts]
+mcp-fuzz = "mcp_fuzz.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["mcp_fuzz"]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+]
