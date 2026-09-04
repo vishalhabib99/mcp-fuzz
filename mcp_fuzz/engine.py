@@ -111,7 +111,14 @@ async def _call_with_outcome(
         result = await asyncio.wait_for(
             conn.session.call_tool(tool_name, arguments), timeout=timeout
         )
-    except TimeoutError:
+    except asyncio.TimeoutError:
+        # `asyncio.wait_for` raises `asyncio.TimeoutError`. Python 3.11
+        # unified that with the builtin `TimeoutError` (same class), but on
+        # 3.10 they're still distinct — `except TimeoutError` alone misses
+        # it there and this falls through to the generic crash handler
+        # below, misclassifying a genuine timeout as a crash. Caught this
+        # via CI running 3.10 (mcp itself requires >=3.10), not locally,
+        # where dev happened to be on 3.11+.
         await conn.connect()
         return CallOutcome(case, property_name, "timeout", f"no response within {timeout}s")
     except Exception as exc:
