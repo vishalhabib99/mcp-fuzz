@@ -90,9 +90,31 @@ class _ServerConnection:
         self.session = None
 
 
+def _field(model, snake_name: str, camel_name: str):
+    """Reads a pydantic model field whose attribute name differs across
+    `mcp` SDK major versions: mcp<2.0 exposed several `types` fields under
+    their raw camelCase wire name directly (`isError`, `inputSchema`,
+    `readOnlyHint`, ...); mcp>=2.0 renamed them to snake_case
+    (`is_error`, `input_schema`, `read_only_hint`, ...) with the camelCase
+    kept only as a validation alias, not a readable attribute. Verified
+    directly: installing a real target server (`arxiv-mcp-server`, which
+    pins `mcp<2.0`) into the same environment as mcp-fuzz silently
+    downgraded the shared `mcp` package and broke every hardcoded
+    snake_case attribute access with an AttributeError. Since mcp-fuzz's
+    own resolved `mcp` version is independent of whatever the target
+    server uses, and either generation could end up installed here, try
+    the current name first and fall back to the older one rather than
+    assuming either."""
+    if hasattr(model, snake_name):
+        return getattr(model, snake_name)
+    return getattr(model, camel_name)
+
+
 def _is_read_only(tool: types.Tool) -> bool:
     annotations = tool.annotations
-    return bool(annotations is not None and annotations.read_only_hint is True)
+    if annotations is None:
+        return False
+    return _field(annotations, "read_only_hint", "readOnlyHint") is True
 
 
 async def _call_with_outcome(
@@ -125,7 +147,7 @@ async def _call_with_outcome(
         await conn.connect()
         return CallOutcome(case, property_name, "crash", f"{type(exc).__name__}: {exc}")
 
-    if isinstance(result, types.CallToolResult) and result.is_error:
+    if isinstance(result, types.CallToolResult) and _field(result, "is_error", "isError"):
         outcome = "graceful_error" if case != "valid" else "ok"
         # A "valid" call returning is_error is itself worth surfacing, but
         # it's a content-level finding, not a crash — record it as an error
@@ -178,7 +200,7 @@ async def run_fuzz(
             continue
 
         result = ToolResult(name=tool.name, tested=True)
-        schema = tool.input_schema
+        schema = _field(tool, "input_schema", "inputSchema")
 
         valid_args = generate_valid_arguments(schema)
         result.outcomes.append(
