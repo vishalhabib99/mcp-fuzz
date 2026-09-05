@@ -9,8 +9,10 @@ Static analysis can't see any of that. Only running the code can.
 ## Install
 
 ```bash
-pip install mcp-fuzz
+pip install mcp-runtime-check
 ```
+
+(The PyPI *distribution* name is `mcp-runtime-check` — `mcp-fuzz` and close variants were blocked by PyPI's anti-typosquat check as too similar to existing packages, same naming friction mcp-doctor hit. The installed CLI command is still `mcp-fuzz`, and the repo/import package are unchanged.)
 
 ## Use
 
