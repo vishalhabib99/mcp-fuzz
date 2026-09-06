@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 
 from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
-from mcp.shared.exceptions import MCPError
+from mcp.shared.exceptions import McpError as MCPError
 
 # The client SDK also raises MCPError itself (not just for a real response
 # received from the server) when the transport dies or an internal request
