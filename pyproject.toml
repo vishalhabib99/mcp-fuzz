@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mcp-runtime-check"
-version = "0.1.1"
+version = "0.1.2"
 description = "Runtime behavioral testing for MCP servers: calls every tool with schema-derived inputs and checks whether it actually behaves the way its description and schema claim."
 readme = "README.md"
 license = "MIT"

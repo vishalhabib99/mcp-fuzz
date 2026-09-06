@@ -25,6 +25,23 @@ from dataclasses import dataclass, field
 
 from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
+from mcp.shared.exceptions import MCPError
+
+# The client SDK also raises MCPError itself (not just for a real response
+# received from the server) when the transport dies or an internal request
+# timeout elapses — REQUEST_TIMEOUT means "no response was ever received".
+# INVALID_PARAMS is the one code that reliably means "the server actually
+# validated my arguments and rejected them" — every other code (including
+# INTERNAL_ERROR, -32603, which frameworks commonly use to wrap an
+# unhandled exception from the tool's own business logic without killing
+# the process) is treated conservatively as a crash; see the classification
+# logic in `_call_with_outcome` for why that line is drawn exactly there.
+# Read via getattr with the known literal fallback rather than assumed, in
+# case an older `mcp` doesn't expose them on `types` the same way (same
+# defensive style as `_field` below, which exists because of a real
+# cross-version break).
+_REQUEST_TIMEOUT = getattr(types, "REQUEST_TIMEOUT", -32001)
+_INVALID_PARAMS = getattr(types, "INVALID_PARAMS", -32602)
 
 from mcp_fuzz.generator import (
     generate_valid_arguments,
@@ -143,6 +160,43 @@ async def _call_with_outcome(
         # where dev happened to be on 3.11+.
         await conn.connect()
         return CallOutcome(case, property_name, "timeout", f"no response within {timeout}s")
+    except MCPError as exc:
+        if exc.code == _REQUEST_TIMEOUT:
+            # Synthesized by the client SDK itself when its own internal
+            # request timeout elapses — no response was ever received, so
+            # despite arriving as an MCPError this is a timeout, not a
+            # server response. Reconnect: a timed-out in-flight request can
+            # still be pending server-side over the shared connection.
+            await conn.connect()
+            return CallOutcome(case, property_name, "timeout", f"no response within {timeout}s ({exc.message})")
+        if exc.code == _INVALID_PARAMS:
+            # The *only* MCPError code that means "the server actually
+            # validated this call's arguments and rejected them properly"
+            # (e.g. zod's "Invalid input: expected string, received
+            # undefined"). A completed, well-formed rejection — not a
+            # crash. Verified against firecrawl-mcp-server: every one of
+            # its 93 bad-input calls raises exactly this shape.
+            outcome = "valid_call_errored" if case == "valid" else "graceful_error"
+            return CallOutcome(case, property_name, outcome, f"{type(exc).__name__} (code {exc.code}): {exc.message}")
+        # Every other MCPError means either the transport/process died
+        # (CONNECTION_CLOSED, synthesized locally by the client SDK — the
+        # real-crash case, verified via the `kills_process` fixture, which
+        # os._exit()s and produces exactly this shape) or the *server's
+        # own business logic* threw an unhandled exception that some
+        # framework wrapper merely stopped from killing the whole process
+        # (typically INTERNAL_ERROR, -32603) — neither is the server
+        # "behaving the way its schema and description claim", so both
+        # count as a crash. Verified this distinction matters against a
+        # real repo, not just in theory: antvis/mcp-server-chart wraps 133
+        # of 214 bad-input calls' raw internal TypeErrors ("Cannot read
+        # properties of null", "data.map is not a function") as -32603
+        # responses — an earlier version of this fix treated *any*
+        # non-CONNECTION_CLOSED/-REQUEST_TIMEOUT MCPError as graceful,
+        # which silently turned those 133 genuine internal crashes into a
+        # false 100%/A. Only INVALID_PARAMS is safe to trust as "properly
+        # handled" — anything else is conservatively still a crash.
+        await conn.connect()
+        return CallOutcome(case, property_name, "crash", f"{type(exc).__name__} (code {exc.code}): {exc.message}")
     except Exception as exc:
         await conn.connect()
         return CallOutcome(case, property_name, "crash", f"{type(exc).__name__}: {exc}")
