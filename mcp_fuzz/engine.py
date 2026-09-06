@@ -27,13 +27,13 @@ from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
 
 try:
-    # mcp>=2.0 names this MCPError (all-caps). Verified directly: mcp==1.0.0's
-    # wheel only has McpError; mcp==2.1.1 only has MCPError, no back-compat
-    # alias either direction. A prior fix here assumed one name based on
-    # whichever version happened to be resolved locally — passed in one real
-    # environment, ImportError'd in the other, and broke `main` for anyone on
-    # the opposite side of the 2.0 boundary. Same class of break as `_field`
-    # below; don't repeat picking one name as if it were universal.
+    # mcp>=2.0 names this MCPError (all-caps); mcp==1.0.0's wheel only has
+    # McpError — verified directly by inspecting both wheels, no back-compat
+    # alias either direction. Two independent fixes on `main` each hardcoded
+    # one name based on whichever version happened to resolve locally,
+    # passed in that environment, and ImportError'd in the other — the exact
+    # class of break `_field` below already exists to guard against. Try the
+    # current name first, fall back to the older one, same as `_field`.
     from mcp.shared.exceptions import MCPError
 except ImportError:
     from mcp.shared.exceptions import McpError as MCPError
