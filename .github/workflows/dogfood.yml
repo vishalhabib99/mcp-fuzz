@@ -1,0 +1,39 @@
+name: Dogfood a target server
+
+# Manual, on-demand run of the real published CLI against a real MCP server —
+# for when the operator's own machine can't run mcp-fuzz directly (its `mcp`
+# dependency needs Python >=3.10). Reusable across future dogfood passes, not
+# just this one.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_cmd:
+        description: "Command to launch the target MCP server (everything after mcp-fuzz's --)"
+        required: true
+      extra_args:
+        description: "Extra mcp-fuzz flags, e.g. --include-destructive"
+        required: false
+        default: ""
+
+jobs:
+  dogfood:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: pip install -e .
+      - name: Run mcp-fuzz against target
+        run: |
+          set -o pipefail
+          mcp-fuzz ${{ github.event.inputs.extra_args }} -- ${{ github.event.inputs.target_cmd }} | tee dogfood-report.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dogfood-report
+          path: dogfood-report.txt
