@@ -19,9 +19,8 @@ test_engine.py for the real end-to-end subprocess tests.
 import asyncio
 
 import pytest
-from mcp.shared.exceptions import McpError as MCPError
 
-from mcp_fuzz.engine import _call_with_outcome
+from mcp_fuzz.engine import MCPError, _call_with_outcome
 
 
 class _StubConnection:

@@ -25,7 +25,18 @@ from dataclasses import dataclass, field
 
 from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
-from mcp.shared.exceptions import McpError as MCPError
+
+try:
+    # mcp>=2.0 names this MCPError (all-caps). Verified directly: mcp==1.0.0's
+    # wheel only has McpError; mcp==2.1.1 only has MCPError, no back-compat
+    # alias either direction. A prior fix here assumed one name based on
+    # whichever version happened to be resolved locally — passed in one real
+    # environment, ImportError'd in the other, and broke `main` for anyone on
+    # the opposite side of the 2.0 boundary. Same class of break as `_field`
+    # below; don't repeat picking one name as if it were universal.
+    from mcp.shared.exceptions import MCPError
+except ImportError:
+    from mcp.shared.exceptions import McpError as MCPError
 
 # The client SDK also raises MCPError itself (not just for a real response
 # received from the server) when the transport dies or an internal request
