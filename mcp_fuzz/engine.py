@@ -25,7 +25,15 @@ from dataclasses import dataclass, field
 
 from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
-from mcp.shared.exceptions import McpError as MCPError
+
+# The exception class's own name has changed casing across mcp SDK releases
+# (`McpError` vs `MCPError`) independently of the major-version boundary
+# that motivates `_field` below — verified by two consecutive CI installs
+# resolving different casings minutes apart. Try both rather than assume.
+try:
+    from mcp.shared.exceptions import McpError as MCPError
+except ImportError:
+    from mcp.shared.exceptions import MCPError  # noqa: F401
 
 # The client SDK also raises MCPError itself (not just for a real response
 # received from the server) when the transport dies or an internal request
