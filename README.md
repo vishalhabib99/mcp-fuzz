@@ -6,6 +6,8 @@ Runtime behavioral testing for [MCP](https://modelcontextprotocol.io) servers.
 
 Static analysis can't see any of that. Only running the code can.
 
+It still deliberately stops short of judging whether a *successful* call's response is actually correct — a schema-only placeholder value usually isn't realistic enough to fairly judge that. [`mcp-reality-check`](https://github.com/vishalhabib99/mcp-reality-check) is the third tool in the family that picks up exactly that: does it fail safely, and does it actually work.
+
 ## Install
 
 ```bash
