@@ -15,6 +15,10 @@ on:
         description: "Extra mcp-fuzz flags, e.g. --include-destructive"
         required: false
         default: ""
+      pip_install:
+        description: "Optional: pip package to install for a Python-based target server (e.g. mcp-server-fetch)"
+        required: false
+        default: ""
 
 jobs:
   dogfood:
@@ -28,6 +32,9 @@ jobs:
         with:
           node-version: "20"
       - run: pip install -e .
+      - name: Install target server (if a pip package)
+        if: github.event.inputs.pip_install != ''
+        run: pip install ${{ github.event.inputs.pip_install }}
       - name: Run mcp-fuzz against target
         run: |
           set -o pipefail
