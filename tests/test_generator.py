@@ -113,3 +113,35 @@ def test_empty_schema_produces_no_variants():
     assert generate_valid_arguments(None) == {}
     assert missing_required_variants(None) == []
     assert wrong_type_variants(None) == []
+
+
+# Adversarial/malformed metadata: a target server's `tools/list` response
+# isn't guaranteed well-formed, and this module auditing that server should
+# never itself crash on the server's own broken schema.
+
+def test_non_dict_top_level_schema_produces_no_variants():
+    for schema in (["not", "a", "schema"], "garbage", 42):
+        assert generate_valid_arguments(schema) == {}
+        assert missing_required_variants(schema) == []
+        assert wrong_type_variants(schema) == []
+
+
+def test_non_dict_properties_produces_no_variants():
+    for properties in (["not", "a", "dict"], "garbage", 42):
+        schema = {"type": "object", "properties": properties, "required": ["x"]}
+        assert generate_valid_arguments(schema) == {}
+        assert wrong_type_variants(schema) == []
+
+
+def test_non_list_required_is_ignored_rather_than_iterated_char_by_char():
+    schema = {"type": "object", "properties": {"x": {"type": "string"}}, "required": "x"}
+    assert missing_required_variants(schema) == []
+
+
+def test_deeply_nested_schema_does_not_blow_recursion_limit():
+    schema: dict = {"type": "string"}
+    for _ in range(5000):
+        schema = {"type": "object", "properties": {"x": schema}, "required": ["x"]}
+    # No assertion on the exact value beyond the depth cutoff — the point is
+    # that generation terminates instead of raising RecursionError.
+    generate_valid_arguments(schema)
