@@ -75,6 +75,18 @@ The firecrawl false-0%/F above led to a genuinely tricky classification bug, wor
 
 The first fix attempt only excluded case 2 and treated every other `MCPError` as graceful. That over-corrected: re-running it against `antvis/mcp-server-chart` (the 37.85%/F finding above) silently flipped it to a false **100%/A**. The real cause: many frameworks use a *third* code, `-32603 INTERNAL_ERROR`, to wrap an **unhandled exception from the tool's own business logic** (a raw `TypeError: Cannot read properties of null`) so it doesn't kill the whole process — a completed round trip, but not the server "behaving the way its schema claims" either. The correct rule, verified against both repos simultaneously (each has the other as its regression test): only `-32602 INVALID_PARAMS` is trusted as "properly handled"; every other code, including `-32603`, stays a crash. Re-checked against both real repos afterward: `firecrawl-mcp-server` 100%/A, `antvis/mcp-server-chart` back to the original, correct **37.85%/F** (exactly 133/214) — the fix removed the false positive without touching the real finding.
 
+### Hardened against malformed tool metadata (not just bad tool-call arguments)
+
+Everything above tests whether a *target server's tool handlers* fail safely on bad input. A [comment on the trilogy writeup](https://dev.to/vishalhabib99/i-built-three-tools-to-audit-mcp-servers-each-one-found-a-bug-in-itself-first-5dlc) pointed out the gap one level up: nothing tested whether **mcp-fuzz itself** stays standing when the `tools/list` response it's fuzzing *from* is malformed — the contract between mcp-fuzz and the server, not the server's own tool logic.
+
+It didn't. Feeding the schema generator adversarial `tools/list` metadata by hand turned up three real crashes in mcp-fuzz's own code, all in the same place — real MCP servers just don't happen to send this kind of metadata, so nothing here had exercised it before:
+
+- `properties` (or the whole `inputSchema`) coming back as a non-object — `AttributeError: 'list' object has no attribute 'items'`.
+- `required` coming back as a string instead of a list — silently iterated character-by-character instead of raising, which is arguably worse than a crash (wrong output with no signal anything was off).
+- A schema nested a few thousand levels deep — `RecursionError`, well within what a misbehaving code generator could produce by accident.
+
+Fixed by treating any of these the same way the rest of the module already treats "no usable type information": generate a safe placeholder or nothing at all, never propagate the exception. A depth cap (50 levels — no real tool schema goes anywhere near that) stops the recursion case; type checks before every `.items()`/iteration stop the rest. 4 new regression tests (41 total).
+
 ## Known limitations
 
 - Input generation is schema-only. A property with no `type` (or a genuinely ambiguous `anyOf`) is skipped from the wrong-type test set rather than guessed at.

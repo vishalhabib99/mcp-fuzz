@@ -17,11 +17,22 @@ Anything the schema doesn't pin down (no `type`, an `anyOf`/`oneOf` with
 genuinely different shapes, a `$ref` this module doesn't resolve) is left
 out of the wrong-type set rather than guessed at — a value that might
 legitimately be valid isn't a useful "wrong type" test case.
+
+A schema here comes straight off the wire from `tools/list` on whatever
+server is being fuzzed — nothing in the MCP spec or SDK guarantees it's
+well-formed. `properties`/`required` can be the wrong JSON type, or the
+whole schema can be nested deep enough to blow Python's recursion limit.
+Every public entry point below treats a malformed or adversarial schema as
+"generate nothing useful" rather than letting the exception propagate —
+this module auditing a target server should never crash on that target's
+own broken metadata.
 """
 
 from __future__ import annotations
 
 from typing import Any
+
+_MAX_SCHEMA_DEPTH = 50
 
 _STRING_FORMAT_SAMPLES = {
     "date": "2026-01-01",
@@ -63,8 +74,15 @@ def _sample_number(schema: dict[str, Any], integer: bool) -> int | float:
     return int(value) if integer else float(value)
 
 
-def generate_valid_value(schema: dict[str, Any]) -> Any:
-    """One plausible value for a single property's schema fragment."""
+def generate_valid_value(schema: dict[str, Any], _depth: int = 0) -> Any:
+    """One plausible value for a single property's schema fragment.
+
+    `_depth` guards against a schema nested deeper than any real tool would
+    need — a malformed or adversarial `object`/`array` schema that nests
+    thousands of levels deep would otherwise blow Python's recursion limit
+    before this ever gets to run a single test call."""
+    if _depth > _MAX_SCHEMA_DEPTH:
+        return "test"
     if "const" in schema:
         return schema["const"]
     if "default" in schema:
@@ -73,7 +91,7 @@ def generate_valid_value(schema: dict[str, Any]) -> Any:
         return schema["enum"][0]
     for combinator in ("anyOf", "oneOf"):
         if combinator in schema and schema[combinator]:
-            return generate_valid_value(schema[combinator][0])
+            return generate_valid_value(schema[combinator][0], _depth + 1)
     schema_type = schema.get("type")
     if isinstance(schema_type, list):
         schema_type = next((t for t in schema_type if t != "null"), schema_type[0])
@@ -88,10 +106,14 @@ def generate_valid_value(schema: dict[str, Any]) -> Any:
     if schema_type == "array":
         items_schema = schema.get("items", {})
         min_items = schema.get("minItems", 1) or 1
-        sample = generate_valid_value(items_schema) if isinstance(items_schema, dict) else "test"
+        sample = (
+            generate_valid_value(items_schema, _depth + 1)
+            if isinstance(items_schema, dict)
+            else "test"
+        )
         return [sample for _ in range(max(min_items, 1))]
     if schema_type == "object":
-        return generate_valid_object(schema)
+        return generate_valid_object(schema, _depth + 1)
     if schema_type == "null":
         return None
     # No usable type information — a generic placeholder is better than
@@ -100,25 +122,33 @@ def generate_valid_value(schema: dict[str, Any]) -> Any:
     return "test"
 
 
-def generate_valid_object(schema: dict[str, Any]) -> dict[str, Any]:
+def generate_valid_object(schema: dict[str, Any], _depth: int = 0) -> dict[str, Any]:
     """A plausible object for an `{"type": "object", "properties": {...}}`
     schema — every `required` property filled in, plus any optional
     property that itself has an `enum`/`const`/`default` (cheap to include,
     makes the "valid" call more representative)."""
+    if _depth > _MAX_SCHEMA_DEPTH:
+        return {}
     properties = schema.get("properties", {})
-    required = set(schema.get("required", []))
+    if not isinstance(properties, dict):
+        # A server returning `properties` as something other than an
+        # object is malformed metadata, not a real schema — nothing to
+        # generate from it, same as no properties at all.
+        properties = {}
+    required_raw = schema.get("required", [])
+    required = set(required_raw) if isinstance(required_raw, list) else set()
     result: dict[str, Any] = {}
     for name, prop_schema in properties.items():
         if not isinstance(prop_schema, dict):
             continue
         if name in required or any(k in prop_schema for k in ("enum", "const", "default")):
-            result[name] = generate_valid_value(prop_schema)
+            result[name] = generate_valid_value(prop_schema, _depth + 1)
     return result
 
 
 def generate_valid_arguments(input_schema: dict[str, Any] | None) -> dict[str, Any]:
     """The full argument dict for a tool call that should succeed."""
-    if not input_schema:
+    if not isinstance(input_schema, dict):
         return {}
     return generate_valid_object(input_schema)
 
@@ -126,10 +156,10 @@ def generate_valid_arguments(input_schema: dict[str, Any] | None) -> dict[str, A
 def missing_required_variants(input_schema: dict[str, Any] | None) -> list[tuple[str, dict[str, Any]]]:
     """(property_name, arguments) for each required property, omitted one
     at a time from an otherwise-valid call."""
-    if not input_schema:
+    if not isinstance(input_schema, dict):
         return []
     required = input_schema.get("required", [])
-    if not required:
+    if not isinstance(required, list) or not required:
         return []
     base = generate_valid_arguments(input_schema)
     variants = []
@@ -161,10 +191,10 @@ def wrong_type_variants(input_schema: dict[str, Any] | None) -> list[tuple[str, 
     """(property_name, arguments) for each property whose schema has an
     unambiguous single `type`, with that one property swapped to a value of
     a different JSON type in an otherwise-valid call."""
-    if not input_schema:
+    if not isinstance(input_schema, dict):
         return []
     properties = input_schema.get("properties", {})
-    if not properties:
+    if not isinstance(properties, dict) or not properties:
         return []
     base = generate_valid_arguments(input_schema)
     variants = []
