@@ -92,3 +92,62 @@ def test_report_scores_crash_resilience_without_penalizing_valid_call_errors(fuz
     # real and surfaced, just not folded into the bad-input crash score.
     flagged = [t for t in report.tools if t.valid_call_issue is not None]
     assert {t.name for t in flagged} == {"hangs_forever", "always_crashes", "kills_process"}
+
+
+ENV_REQUIRED_SERVER = str(Path(__file__).parent / "fixtures" / "env_required_server.py")
+
+
+def test_env_kwarg_is_passed_through_to_the_target_server():
+    # Verified against a real failure: brave/brave-search-mcp-server refuses
+    # to start at all without BRAVE_API_KEY set. Without this working, the
+    # only way to fuzz any API-key-gated server would be if that key
+    # happened to already be in the SDK's own safe default allowlist, which
+    # by design it never is.
+    import asyncio
+
+    report = asyncio.run(run_fuzz(
+        sys.executable, [ENV_REQUIRED_SERVER],
+        env={"REQUIRED_TEST_KEY": "expected-value"}, timeout=TIMEOUT,
+    ))
+    assert report.connect_error is None
+
+
+def test_no_env_kwarg_does_not_leak_or_guess_the_required_value():
+    # The flip side: without an explicit env, the server must NOT start —
+    # confirms this isn't accidentally inheriting the operator's full shell
+    # environment (which would be a real secret-leaking regression), only
+    # the SDK's own minimal safe default (PATH, HOME, ...).
+    import asyncio
+
+    report = asyncio.run(run_fuzz(sys.executable, [ENV_REQUIRED_SERVER], timeout=TIMEOUT))
+    assert report.connect_error is not None
+
+
+def test_env_kwarg_merges_onto_safe_defaults_rather_than_replacing_them():
+    # A caller passing one custom var (e.g. --env BRAVE_API_KEY=...) must not
+    # lose PATH/HOME in the process — verified against a real failure mode:
+    # passing only BRAVE_API_KEY with no PATH would break `npx` itself
+    # before the target server ever runs, a strictly worse outcome than the
+    # SDK's own default. A pure unit test on the merge itself rather than an
+    # end-to-end subprocess launch, since a bare PATH-resolved command name
+    # isn't portable across environments (the system `python3` on this
+    # machine's PATH, for instance, isn't the one `mcp` is installed into).
+    from mcp.client.stdio import get_default_environment
+
+    from mcp_fuzz.engine import _merged_env
+
+    merged = _merged_env({"REQUIRED_TEST_KEY": "expected-value"})
+    assert merged["REQUIRED_TEST_KEY"] == "expected-value"
+    for key in get_default_environment():
+        assert key in merged
+
+
+def test_no_env_is_passed_through_unchanged():
+    # env=None/{} must not go through the merge at all — confirms `_merged_env`
+    # doesn't change `run_fuzz`'s existing default behavior (the SDK's own
+    # `get_default_environment()` fallback) for every caller that never
+    # passes `env`, which is every caller before this option existed.
+    from mcp_fuzz.engine import _merged_env
+
+    assert _merged_env(None) is None
+    assert _merged_env({}) == {}

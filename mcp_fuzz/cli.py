@@ -31,6 +31,12 @@ def main() -> None:
         "Safety section before turning this on against a server with real side effects.",
     )
     parser.add_argument(
+        "--env", action="append", default=[], metavar="KEY=VALUE",
+        help="pass an environment variable through to the target server (repeatable), e.g. "
+        "--env BRAVE_API_KEY=... . Without this, only a safe minimal set (PATH, HOME, ...) "
+        "is inherited — many real servers need an API key to start at all.",
+    )
+    parser.add_argument(
         "--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS,
         help=f"seconds to wait for a single tool call before treating it as a hang (default {DEFAULT_TIMEOUT_SECONDS})",
     )
@@ -45,10 +51,18 @@ def main() -> None:
     if not command_parts:
         parser.error("no server command given — e.g. `mcp-fuzz -- python server.py`")
 
+    env = {}
+    for pair in args.env:
+        key, sep, value = pair.partition("=")
+        if not sep:
+            parser.error(f"--env expects KEY=VALUE, got {pair!r}")
+        env[key] = value
+
     command, *rest = command_parts
     raw = asyncio.run(run_fuzz(
         command=command,
         args=rest,
+        env=env or None,
         include_destructive=args.include_destructive,
         timeout=args.timeout,
     ))

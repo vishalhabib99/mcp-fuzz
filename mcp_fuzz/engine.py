@@ -24,7 +24,7 @@ from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 
 from mcp import ClientSession, StdioServerParameters, types
-from mcp.client.stdio import stdio_client
+from mcp.client.stdio import get_default_environment, stdio_client
 
 try:
     # mcp>=2.0 names this MCPError (all-caps); mcp==1.0.0's wheel only has
@@ -228,6 +228,22 @@ async def _call_with_outcome(
     return CallOutcome(case, property_name, "ok")
 
 
+def _merged_env(env: dict[str, str] | None) -> dict[str, str] | None:
+    """`StdioServerParameters(env=None)` doesn't inherit the operator's shell —
+    the SDK's own `stdio_client` deliberately falls back to a minimal safe
+    allowlist (PATH, HOME, ...), never arbitrary app-specific vars, as a real
+    security default against leaking secrets into a launched server. A
+    caller that *does* pass `env` almost always means "also set this one API
+    key", not "replace PATH/HOME entirely" — verified against a real
+    failure: `brave/brave-search-mcp-server` refuses to start at all without
+    `BRAVE_API_KEY`, and passing just that one var with no PATH would break
+    `npx` before the target server ever runs. Merge onto the same safe
+    baseline the SDK already uses when `env` is left unset, rather than
+    replacing it; `env=None`/`{}` is passed through unchanged so the SDK's
+    own default still applies exactly as before this existed."""
+    return {**get_default_environment(), **env} if env else env
+
+
 async def run_fuzz(
     command: str,
     args: list[str] | None = None,
@@ -236,7 +252,8 @@ async def run_fuzz(
     include_destructive: bool = False,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> FuzzReport:
-    params = StdioServerParameters(command=command, args=args or [], env=env, cwd=cwd)
+    merged_env = _merged_env(env)
+    params = StdioServerParameters(command=command, args=args or [], env=merged_env, cwd=cwd)
     server_label = " ".join([command, *(args or [])])
     report = FuzzReport(server_command=server_label)
 
