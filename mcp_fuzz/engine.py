@@ -20,6 +20,7 @@ server doesn't invalidate every result after it.
 from __future__ import annotations
 
 import asyncio
+import time
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 
@@ -69,6 +70,13 @@ class CallOutcome:
     property_name: str | None
     outcome: str  # "ok" | "graceful_error" | "crash" | "timeout"
     detail: str = ""
+    # Populated for --full-trace export (see mcp_fuzz.trace): the report's
+    # own to_dict() intentionally still ignores these three fields for
+    # every non-crash/timeout/valid_call_issue outcome, so the scored
+    # --json report is unaffected by adding them here.
+    arguments: dict = field(default_factory=dict)
+    started_at: float = 0.0  # epoch seconds
+    duration_ms: float = 0.0
 
 
 @dataclass
@@ -284,20 +292,31 @@ async def run_fuzz(
         result = ToolResult(name=tool.name, tested=True)
         schema = _field(tool, "input_schema", "inputSchema")
 
+        async def _timed_call(case: str, prop_name: str | None, call_args: dict) -> CallOutcome:
+            # Deliberately wraps _call_with_outcome from the outside rather
+            # than threading timing/arguments through its own return
+            # statements: that function's crash/timeout/graceful_error
+            # classification is carefully verified against real repos (see
+            # its own comments), and duplicating call_args/timestamp capture
+            # across every one of its return sites would risk a transcription
+            # slip in logic that's already correct. A dataclass field set
+            # after construction can't affect anything upstream that already
+            # inspects `outcome`/`detail`.
+            started = time.time()
+            outcome = await _call_with_outcome(conn, params, tool.name, case, prop_name, call_args, timeout)
+            outcome.arguments = call_args
+            outcome.started_at = started
+            outcome.duration_ms = (time.time() - started) * 1000
+            return outcome
+
         valid_args = generate_valid_arguments(schema)
-        result.outcomes.append(
-            await _call_with_outcome(conn, params, tool.name, "valid", None, valid_args, timeout)
-        )
+        result.outcomes.append(await _timed_call("valid", None, valid_args))
 
         for prop_name, args in missing_required_variants(schema):
-            result.outcomes.append(
-                await _call_with_outcome(conn, params, tool.name, "missing_required", prop_name, args, timeout)
-            )
+            result.outcomes.append(await _timed_call("missing_required", prop_name, args))
 
         for prop_name, args in wrong_type_variants(schema):
-            result.outcomes.append(
-                await _call_with_outcome(conn, params, tool.name, "wrong_type", prop_name, args, timeout)
-            )
+            result.outcomes.append(await _timed_call("wrong_type", prop_name, args))
 
         report.tools.append(result)
 

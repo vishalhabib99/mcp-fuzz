@@ -151,3 +151,31 @@ def test_no_env_is_passed_through_unchanged():
 
     assert _merged_env(None) is None
     assert _merged_env({}) == {}
+
+
+def test_every_outcome_carries_its_own_call_arguments(fuzz_report):
+    # The scored report (report.py) never needed this, so it was easy for
+    # it to go unrecorded entirely — confirms the outer _timed_call wrapper
+    # in run_fuzz actually attaches it to every outcome, not just some.
+    tool = _tool(fuzz_report, "well_behaved")
+    for outcome in tool.outcomes:
+        assert isinstance(outcome.arguments, dict)
+    missing = next(o for o in tool.outcomes if o.case == "missing_required")
+    assert missing.property_name not in missing.arguments
+
+
+def test_every_outcome_carries_real_timing(fuzz_report):
+    # started_at/duration_ms come from wall-clock time.time() around the
+    # real call, not a placeholder — a hanging call should show a duration
+    # close to the fixture's TIMEOUT, not 0.
+    tool = _tool(fuzz_report, "hangs_forever")
+    valid = next(o for o in tool.outcomes if o.case == "valid")
+    assert valid.outcome == "timeout"
+    assert valid.started_at > 0
+    assert valid.duration_ms >= TIMEOUT * 1000 * 0.9  # allow a little slack, not an exact bound
+
+
+def test_skipped_tools_have_no_outcomes_but_still_carry_a_reason(fuzz_report):
+    tool = _tool(fuzz_report, "delete_everything")
+    assert tool.outcomes == []
+    assert tool.skip_reason is not None
