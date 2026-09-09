@@ -7,6 +7,7 @@ import sys
 
 from mcp_fuzz.engine import DEFAULT_TIMEOUT_SECONDS, run_fuzz
 from mcp_fuzz.report import build_report, render_text, to_dict
+from mcp_fuzz.trace import write_jsonl_trace
 
 
 def main() -> None:
@@ -45,6 +46,13 @@ def main() -> None:
         "--fail-under", type=float, default=None,
         help="exit non-zero if the crash-resilience percent is below this threshold",
     )
+    parser.add_argument(
+        "--full-trace", metavar="PATH", default=None,
+        help="also write every call's full detail (tool, case, arguments, outcome, "
+        "timing — not just crashes/timeouts) as JSONL to PATH, for feeding a real "
+        "session into an external evidence/trajectory tool. The scored --json report "
+        "deliberately drops this detail; this doesn't change that report at all.",
+    )
     args = parser.parse_args()
 
     command_parts = [c for c in args.command if c != "--"]
@@ -67,6 +75,9 @@ def main() -> None:
         timeout=args.timeout,
     ))
     report = build_report(raw)
+
+    if args.full_trace:
+        write_jsonl_trace(raw, args.full_trace)
 
     if args.json:
         print(json.dumps(to_dict(report), indent=2))

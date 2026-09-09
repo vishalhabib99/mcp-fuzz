@@ -52,6 +52,18 @@ mcp-fuzz --json -- python server.py
 mcp-fuzz --fail-under 90 -- python server.py   # non-zero exit if crash resilience < 90%
 ```
 
+## Full-fidelity trace export
+
+`--json`'s report is deliberately narrow — it exists to answer "what's the crash-resilience score," so it drops every "ok" outcome, the call arguments, and any timing. That's the right shape for the score, wrong shape for reconstructing what a run actually did call by call — useful if you want to feed a real session into an external evidence or trajectory-debugging tool.
+
+```bash
+mcp-fuzz --full-trace session.jsonl -- python server.py
+```
+
+Writes one JSON line per tool call (`tool`, `case`, `property`, `outcome`, `detail`, `arguments`, `startedAt`, `durationMs`), plus one line per skipped tool — independent of, and in addition to, whatever `--json`/text report you also asked for.
+
+Added after an actual external ask, not speculatively: [`agent-inspect`](https://github.com/rajudandigam/agent-inspect) (a TypeScript agent-trajectory/evidence-debugging tool) asked what it would take to feed a real mcp-fuzz session into its evidence model. Before this flag existed, the only way to do that was a one-off script that duplicated mcp-fuzz's own input generators just to recover the arguments and timing `--json` throws away — this flag makes that a first-class, supported path instead. Feeding a session through confirmed a real, useful finding along the way: mcp-fuzz's `graceful_error`/`valid_call_errored` outcomes (the *good*, correctly-handled case) map naturally onto a generic trajectory tool's `status:error`/"failed" vocabulary, which reads a healthy 100%/A crash-resilience session as mostly broken unless the consumer knows to treat those two outcomes as distinct from `crash`/`timeout`. Worth remembering for anyone else piping this JSONL into a similar tool.
+
 ## Real-world spot check
 
 | Repo | Stars | Lang | What mcp-fuzz found |
