@@ -2,6 +2,10 @@
 
 Runtime behavioral testing for [MCP](https://modelcontextprotocol.io) servers.
 
+![mcp-fuzz run against the official @modelcontextprotocol/server-memory reference server: Crash resilience 100% (A), 9/9 tools tested, all ok](docs/demo.png)
+
+*Real output from a live `--include-destructive` run against the official [`@modelcontextprotocol/server-memory`](https://github.com/modelcontextprotocol/servers/tree/main/src/memory) reference server — not a synthetic example.*
+
 [`mcp-doctor`](https://github.com/vishalhabib99/mcp-doctor) reads an MCP server's *source code* and checks whether its tools are well-documented. `mcp-fuzz` does the opposite: it actually **launches the server and calls its tools**, with inputs derived from each tool's own declared JSON schema, and checks whether the server behaves the way that schema and its description claim — does a missing required field get a structured error back, or does the server crash? Does a wrong-typed field get rejected cleanly, or does it hang?
 
 Static analysis can't see any of that. Only running the code can.
