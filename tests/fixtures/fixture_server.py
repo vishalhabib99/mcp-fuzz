@@ -71,5 +71,15 @@ def kills_process(x: str) -> str:
     os._exit(1)
 
 
+@server.tool(annotations=READ_ONLY)
+def slow_but_fine(value: str) -> str:
+    """Sleeps briefly then returns normally — well under the timeout, so it
+    should never be flagged as a crash or hang, only (relative to this
+    fixture server's other near-instant tools) as unusually slow by the
+    latency check."""
+    time.sleep(1.2)
+    return value
+
+
 if __name__ == "__main__":
     server.run(transport="stdio")

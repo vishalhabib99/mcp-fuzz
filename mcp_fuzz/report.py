@@ -21,6 +21,18 @@ from mcp_fuzz.engine import CallOutcome, FuzzReport, ToolResult
 
 BAD_INPUT_CASES = {"missing_required", "wrong_type"}
 
+# A tool's "valid" call is the one real, representative round-trip for
+# latency purposes — bad-input calls are typically rejected before the
+# server does any real work, so timing them would understate a slow tool's
+# real cost. Two independent signals, either one enough to flag a tool:
+# an absolute ceiling (a lone slow tool is still slow even with nothing to
+# compare it to) and a relative-outlier check against this server's own
+# other tools (a fair comparison only once there's enough of a sample to
+# call something an outlier at all).
+LATENCY_ABSOLUTE_SLOW_MS = 5000.0
+LATENCY_OUTLIER_MULTIPLIER = 3.0
+MIN_TOOLS_FOR_RELATIVE_OUTLIER = 3
+
 
 @dataclass
 class ToolReport:
@@ -31,6 +43,27 @@ class ToolReport:
     timeouts: list[CallOutcome] = field(default_factory=list)
     valid_call_issue: CallOutcome | None = None
     bad_input_case_count: int = 0
+    # None when the tool wasn't tested, or its valid call crashed/timed out —
+    # that duration is contaminated by reconnect/timeout overhead, not a real
+    # measurement of the server's own processing time, and the crash/timeout
+    # is already surfaced by the crash-resilience score above.
+    valid_call_duration_ms: float | None = None
+
+
+@dataclass
+class LatencyFlag:
+    name: str
+    duration_ms: float
+    reasons: list[str]
+
+
+@dataclass
+class LatencySummary:
+    checked_count: int
+    median_ms: float | None
+    slow_tools: list[LatencyFlag]
+    percent: float | None
+    grade: str | None
 
 
 @dataclass
@@ -45,6 +78,7 @@ class Report:
     timeout_count: int
     crash_resilience_percent: float | None
     grade: str | None
+    latency: LatencySummary
 
 
 def _grade_for_percent(pct: float) -> str:
@@ -59,7 +93,7 @@ def _grade_for_percent(pct: float) -> str:
     return "F"
 
 
-def build_report(raw: FuzzReport) -> Report:
+def build_report(raw: FuzzReport, slow_threshold_ms: float = LATENCY_ABSOLUTE_SLOW_MS) -> Report:
     tool_reports: list[ToolReport] = []
     total_bad_input = 0
     total_crashes = 0
@@ -81,6 +115,8 @@ def build_report(raw: FuzzReport) -> Report:
             if outcome.case == "valid":
                 if outcome.outcome in ("crash", "timeout", "valid_call_errored"):
                     tr.valid_call_issue = outcome
+                if outcome.outcome not in ("crash", "timeout"):
+                    tr.valid_call_duration_ms = outcome.duration_ms
                 continue
             if outcome.case not in BAD_INPUT_CASES:
                 continue
@@ -112,6 +148,39 @@ def build_report(raw: FuzzReport) -> Report:
         timeout_count=total_timeouts,
         crash_resilience_percent=percent,
         grade=grade,
+        latency=_compute_latency(tool_reports, slow_threshold_ms),
+    )
+
+
+def _median(values: list[float]) -> float:
+    values = sorted(values)
+    mid = len(values) // 2
+    if len(values) % 2 == 1:
+        return values[mid]
+    return (values[mid - 1] + values[mid]) / 2
+
+
+def _compute_latency(tool_reports: list[ToolReport], slow_threshold_ms: float) -> LatencySummary:
+    timed = [(t.name, t.valid_call_duration_ms) for t in tool_reports if t.valid_call_duration_ms is not None]
+    if not timed:
+        return LatencySummary(checked_count=0, median_ms=None, slow_tools=[], percent=None, grade=None)
+
+    median = _median([d for _, d in timed])
+    enough_for_relative = len(timed) >= MIN_TOOLS_FOR_RELATIVE_OUTLIER and median > 0
+    slow_tools: list[LatencyFlag] = []
+    for name, duration in timed:
+        reasons = []
+        if duration > slow_threshold_ms:
+            reasons.append(f"{duration:.0f}ms, over the {slow_threshold_ms:.0f}ms absolute threshold")
+        if enough_for_relative and duration > LATENCY_OUTLIER_MULTIPLIER * median:
+            reasons.append(f"{duration / median:.1f}x this server's median ({median:.0f}ms)")
+        if reasons:
+            slow_tools.append(LatencyFlag(name=name, duration_ms=duration, reasons=reasons))
+
+    percent = 100.0 * (len(timed) - len(slow_tools)) / len(timed)
+    grade = _grade_for_percent(percent)
+    return LatencySummary(
+        checked_count=len(timed), median_ms=median, slow_tools=slow_tools, percent=percent, grade=grade,
     )
 
 
@@ -132,12 +201,25 @@ def render_text(report: Report) -> str:
     else:
         lines.append("Crash resilience: n/a (no testable tools had any parameters to fuzz)")
     lines.append(f"Tested {report.tested_count} tool(s), skipped {report.skipped_count} (not read-only)")
+
+    lat = report.latency
+    if lat.percent is not None:
+        lines.append(
+            f"Latency: {lat.percent:.0f}% ({lat.grade}) — {len(lat.slow_tools)} tool(s) flagged slow "
+            f"out of {lat.checked_count} checked (server median {lat.median_ms:.0f}ms; "
+            "single real call per tool, not a load test — see README)"
+        )
+    else:
+        lines.append("Latency: n/a (no tool completed a timed valid call)")
     lines.append("")
+
+    slow_by_name = {f.name: f for f in report.latency.slow_tools}
 
     for tool in report.tools:
         if not tool.tested:
             lines.append(f"  [skip] {tool.name} — {tool.skip_reason}")
             continue
+        slow_flag = slow_by_name.get(tool.name)
         flags = []
         if tool.crashes:
             flags.append(f"{len(tool.crashes)} crash(es)")
@@ -145,11 +227,15 @@ def render_text(report: Report) -> str:
             flags.append(f"{len(tool.timeouts)} timeout(s)")
         if tool.valid_call_issue:
             flags.append(f"valid call: {tool.valid_call_issue.outcome}")
-        marker = "FAIL" if (tool.crashes or tool.timeouts) else ("WARN" if tool.valid_call_issue else "ok")
+        if slow_flag:
+            flags.append("slow")
+        marker = "FAIL" if (tool.crashes or tool.timeouts) else ("WARN" if (tool.valid_call_issue or slow_flag) else "ok")
         summary = f" — {'; '.join(flags)}" if flags else ""
         lines.append(f"  [{marker}] {tool.name}{summary}")
         for outcome in tool.crashes + tool.timeouts:
             lines.append(f"      {outcome.case} ({outcome.property_name}): {outcome.detail}")
+        if slow_flag:
+            lines.append(f"      slow — {'; '.join(slow_flag.reasons)}")
         if tool.valid_call_issue:
             lines.append(
                 f"      valid call — {tool.valid_call_issue.outcome}: {tool.valid_call_issue.detail} "
@@ -160,6 +246,7 @@ def render_text(report: Report) -> str:
 
 
 def to_dict(report: Report) -> dict:
+    slow_by_name = {f.name: f for f in report.latency.slow_tools}
     return {
         "server_command": report.server_command,
         "connect_error": report.connect_error,
@@ -170,6 +257,16 @@ def to_dict(report: Report) -> dict:
         "timeout_count": report.timeout_count,
         "crash_resilience_percent": report.crash_resilience_percent,
         "grade": report.grade,
+        "latency": {
+            "checked_count": report.latency.checked_count,
+            "median_ms": report.latency.median_ms,
+            "percent": report.latency.percent,
+            "grade": report.latency.grade,
+            "slow_tools": [
+                {"name": f.name, "duration_ms": f.duration_ms, "reasons": f.reasons}
+                for f in report.latency.slow_tools
+            ],
+        },
         "tools": [
             {
                 "name": t.name,
@@ -179,6 +276,8 @@ def to_dict(report: Report) -> dict:
                 "timeouts": [_outcome_dict(o) for o in t.timeouts],
                 "valid_call_issue": _outcome_dict(t.valid_call_issue) if t.valid_call_issue else None,
                 "bad_input_case_count": t.bad_input_case_count,
+                "valid_call_duration_ms": t.valid_call_duration_ms,
+                "slow": slow_by_name.get(t.name).reasons if t.name in slow_by_name else None,
             }
             for t in report.tools
         ],

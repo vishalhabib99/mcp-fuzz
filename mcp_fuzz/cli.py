@@ -6,7 +6,7 @@ import json
 import sys
 
 from mcp_fuzz.engine import DEFAULT_TIMEOUT_SECONDS, run_fuzz
-from mcp_fuzz.report import build_report, render_text, to_dict
+from mcp_fuzz.report import LATENCY_ABSOLUTE_SLOW_MS, build_report, render_text, to_dict
 from mcp_fuzz.trace import write_jsonl_trace
 
 
@@ -47,6 +47,15 @@ def main() -> None:
         help="exit non-zero if the crash-resilience percent is below this threshold",
     )
     parser.add_argument(
+        "--slow-threshold-ms", type=float, default=LATENCY_ABSOLUTE_SLOW_MS,
+        help=f"flag a tool's valid call as slow if it takes longer than this, in milliseconds "
+        f"(default {LATENCY_ABSOLUTE_SLOW_MS:.0f})",
+    )
+    parser.add_argument(
+        "--fail-under-latency", type=float, default=None,
+        help="exit non-zero if the latency percent is below this threshold",
+    )
+    parser.add_argument(
         "--full-trace", metavar="PATH", default=None,
         help="also write every call's full detail (tool, case, arguments, outcome, "
         "timing — not just crashes/timeouts) as JSONL to PATH, for feeding a real "
@@ -74,7 +83,7 @@ def main() -> None:
         include_destructive=args.include_destructive,
         timeout=args.timeout,
     ))
-    report = build_report(raw)
+    report = build_report(raw, slow_threshold_ms=args.slow_threshold_ms)
 
     if args.full_trace:
         write_jsonl_trace(raw, args.full_trace)
@@ -88,6 +97,10 @@ def main() -> None:
         sys.exit(2)
     if args.fail_under is not None and (
         report.crash_resilience_percent is None or report.crash_resilience_percent < args.fail_under
+    ):
+        sys.exit(1)
+    if args.fail_under_latency is not None and (
+        report.latency.percent is None or report.latency.percent < args.fail_under_latency
     ):
         sys.exit(1)
 
