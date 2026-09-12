@@ -91,6 +91,15 @@ class ToolResult:
     tested: bool
     skip_reason: str | None = None
     outcomes: list[CallOutcome] = field(default_factory=list)
+    # Populated only when concurrency > 0 in run_fuzz — see
+    # _run_concurrent_valid_calls. Each outcome comes from an independently
+    # launched connection (a separate subprocess of the same server
+    # command), not the shared sequential connection above, so N of these
+    # running at once is a real test of concurrent access to whatever
+    # backend the server itself talks to (a shared file, database, lock),
+    # not just "can one connection's event loop juggle two in-flight
+    # requests."
+    concurrent_outcomes: list[CallOutcome] = field(default_factory=list)
 
 
 @dataclass
@@ -261,6 +270,33 @@ def _merged_env(env: dict[str, str] | None) -> dict[str, str] | None:
     return {**get_default_environment(), **env} if env else env
 
 
+async def _run_concurrent_valid_calls(
+    params: StdioServerParameters, tool_name: str, valid_args: dict, timeout: float, concurrency: int,
+) -> list[CallOutcome]:
+    """Launches `concurrency` independent connections (each its own
+    subprocess of the target server command) and calls the same tool with
+    the same valid arguments on all of them at once via asyncio.gather —
+    a real test of concurrent access to whatever shared backend the server
+    itself talks to (a shared file, database, lock), which N sequential
+    calls on one connection can never exercise. Each connection is only
+    ever touched by its own coroutine, so there's no shared mutable state
+    between them on mcp-fuzz's own side to race on — any crash/timeout
+    caught here is the target server's own concurrency behavior, not an
+    artifact of how this function drives it."""
+    async def _one_call() -> CallOutcome:
+        conn = _ServerConnection(params)
+        try:
+            await conn.connect()
+        except Exception as exc:
+            return CallOutcome("valid", None, "crash", f"failed to connect: {type(exc).__name__}: {exc}")
+        try:
+            return await _call_with_outcome(conn, params, tool_name, "valid", None, valid_args, timeout)
+        finally:
+            await conn.close()
+
+    return list(await asyncio.gather(*(_one_call() for _ in range(concurrency))))
+
+
 async def run_fuzz(
     command: str,
     args: list[str] | None = None,
@@ -268,6 +304,7 @@ async def run_fuzz(
     cwd: str | None = None,
     include_destructive: bool = False,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    concurrency: int = 0,
 ) -> FuzzReport:
     merged_env = _merged_env(env)
     params = StdioServerParameters(command=command, args=args or [], env=merged_env, cwd=cwd)
@@ -326,6 +363,11 @@ async def run_fuzz(
 
         for prop_name, args in wrong_type_variants(schema):
             result.outcomes.append(await _timed_call("wrong_type", prop_name, args))
+
+        if concurrency > 0:
+            result.concurrent_outcomes = await _run_concurrent_valid_calls(
+                params, tool.name, valid_args, timeout, concurrency,
+            )
 
         report.tools.append(result)
 

@@ -71,6 +71,18 @@ def main() -> None:
         help="exit non-zero if the response-size percent is below this threshold",
     )
     parser.add_argument(
+        "--concurrency", type=int, default=0, metavar="N",
+        help="for each tested tool, also launch N independent connections and call it at the "
+        "same time (each its own subprocess of the target server) — a real test of concurrent "
+        "access to whatever shared backend the server talks to. Off by default (extra "
+        "subprocess launches per tool); a modest value like 3-5 is usually enough to surface "
+        "a real race.",
+    )
+    parser.add_argument(
+        "--fail-under-concurrency", type=float, default=None,
+        help="exit non-zero if the concurrency percent is below this threshold",
+    )
+    parser.add_argument(
         "--full-trace", metavar="PATH", default=None,
         help="also write every call's full detail (tool, case, arguments, outcome, "
         "timing — not just crashes/timeouts) as JSONL to PATH, for feeding a real "
@@ -97,6 +109,7 @@ def main() -> None:
         env=env or None,
         include_destructive=args.include_destructive,
         timeout=args.timeout,
+        concurrency=args.concurrency,
     ))
     report = build_report(
         raw, slow_threshold_ms=args.slow_threshold_ms, bloat_threshold_chars=args.bloat_threshold_chars,
@@ -122,6 +135,10 @@ def main() -> None:
         sys.exit(1)
     if args.fail_under_response_size is not None and (
         report.response_size.percent is None or report.response_size.percent < args.fail_under_response_size
+    ):
+        sys.exit(1)
+    if args.fail_under_concurrency is not None and (
+        report.concurrency.percent is None or report.concurrency.percent < args.fail_under_concurrency
     ):
         sys.exit(1)
 
