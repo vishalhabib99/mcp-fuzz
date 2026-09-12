@@ -33,6 +33,17 @@ LATENCY_ABSOLUTE_SLOW_MS = 5000.0
 LATENCY_OUTLIER_MULTIPLIER = 3.0
 MIN_TOOLS_FOR_RELATIVE_OUTLIER = 3
 
+# Same two-signal design as latency, applied to response size instead of
+# response time: a tool that dumps an unusually large payload burns an
+# agent's context window for no reason an agent can see coming from the
+# tool's own description. 20000 chars (~5000 tokens on the common ~4
+# chars/token rule of thumb for English text — not a real tokenizer, just a
+# cheap estimate stated as such wherever it's shown) is deliberately
+# generous: this flags genuinely bloated responses, not merely verbose ones.
+RESPONSE_SIZE_ABSOLUTE_CHARS = 20000
+RESPONSE_SIZE_OUTLIER_MULTIPLIER = 3.0
+MIN_TOOLS_FOR_RESPONSE_SIZE_OUTLIER = 3
+
 
 @dataclass
 class ToolReport:
@@ -48,6 +59,9 @@ class ToolReport:
     # measurement of the server's own processing time, and the crash/timeout
     # is already surfaced by the crash-resilience score above.
     valid_call_duration_ms: float | None = None
+    # None for the same reasons as above — a crashed/timed-out call has no
+    # real response to measure the size of.
+    valid_call_response_chars: int | None = None
 
 
 @dataclass
@@ -67,6 +81,22 @@ class LatencySummary:
 
 
 @dataclass
+class ResponseSizeFlag:
+    name: str
+    response_chars: int
+    reasons: list[str]
+
+
+@dataclass
+class ResponseSizeSummary:
+    checked_count: int
+    median_chars: float | None
+    bloated_tools: list[ResponseSizeFlag]
+    percent: float | None
+    grade: str | None
+
+
+@dataclass
 class Report:
     server_command: str
     connect_error: str | None
@@ -79,6 +109,7 @@ class Report:
     crash_resilience_percent: float | None
     grade: str | None
     latency: LatencySummary
+    response_size: ResponseSizeSummary
 
 
 def _grade_for_percent(pct: float) -> str:
@@ -93,7 +124,11 @@ def _grade_for_percent(pct: float) -> str:
     return "F"
 
 
-def build_report(raw: FuzzReport, slow_threshold_ms: float = LATENCY_ABSOLUTE_SLOW_MS) -> Report:
+def build_report(
+    raw: FuzzReport,
+    slow_threshold_ms: float = LATENCY_ABSOLUTE_SLOW_MS,
+    bloat_threshold_chars: int = RESPONSE_SIZE_ABSOLUTE_CHARS,
+) -> Report:
     tool_reports: list[ToolReport] = []
     total_bad_input = 0
     total_crashes = 0
@@ -117,6 +152,7 @@ def build_report(raw: FuzzReport, slow_threshold_ms: float = LATENCY_ABSOLUTE_SL
                     tr.valid_call_issue = outcome
                 if outcome.outcome not in ("crash", "timeout"):
                     tr.valid_call_duration_ms = outcome.duration_ms
+                    tr.valid_call_response_chars = outcome.response_chars
                 continue
             if outcome.case not in BAD_INPUT_CASES:
                 continue
@@ -149,6 +185,7 @@ def build_report(raw: FuzzReport, slow_threshold_ms: float = LATENCY_ABSOLUTE_SL
         crash_resilience_percent=percent,
         grade=grade,
         latency=_compute_latency(tool_reports, slow_threshold_ms),
+        response_size=_compute_response_size(tool_reports, bloat_threshold_chars),
     )
 
 
@@ -184,6 +221,30 @@ def _compute_latency(tool_reports: list[ToolReport], slow_threshold_ms: float) -
     )
 
 
+def _compute_response_size(tool_reports: list[ToolReport], bloat_threshold_chars: int) -> ResponseSizeSummary:
+    sized = [(t.name, t.valid_call_response_chars) for t in tool_reports if t.valid_call_response_chars is not None]
+    if not sized:
+        return ResponseSizeSummary(checked_count=0, median_chars=None, bloated_tools=[], percent=None, grade=None)
+
+    median = _median([c for _, c in sized])
+    enough_for_relative = len(sized) >= MIN_TOOLS_FOR_RESPONSE_SIZE_OUTLIER and median > 0
+    bloated_tools: list[ResponseSizeFlag] = []
+    for name, chars in sized:
+        reasons = []
+        if chars > bloat_threshold_chars:
+            reasons.append(f"{chars:,} chars (~{chars // 4:,} est. tokens), over the {bloat_threshold_chars:,}-char absolute threshold")
+        if enough_for_relative and chars > RESPONSE_SIZE_OUTLIER_MULTIPLIER * median:
+            reasons.append(f"{chars / median:.1f}x this server's median ({median:.0f} chars)")
+        if reasons:
+            bloated_tools.append(ResponseSizeFlag(name=name, response_chars=chars, reasons=reasons))
+
+    percent = 100.0 * (len(sized) - len(bloated_tools)) / len(sized)
+    grade = _grade_for_percent(percent)
+    return ResponseSizeSummary(
+        checked_count=len(sized), median_chars=median, bloated_tools=bloated_tools, percent=percent, grade=grade,
+    )
+
+
 def render_text(report: Report) -> str:
     lines: list[str] = []
     if report.connect_error:
@@ -211,15 +272,27 @@ def render_text(report: Report) -> str:
         )
     else:
         lines.append("Latency: n/a (no tool completed a timed valid call)")
+
+    rsz = report.response_size
+    if rsz.percent is not None:
+        lines.append(
+            f"Response size: {rsz.percent:.0f}% ({rsz.grade}) — {len(rsz.bloated_tools)} tool(s) flagged bloated "
+            f"out of {rsz.checked_count} checked (server median {rsz.median_chars:.0f} chars; "
+            "single real call per tool, not representative of every possible input — see README)"
+        )
+    else:
+        lines.append("Response size: n/a (no tool completed a sized valid call)")
     lines.append("")
 
     slow_by_name = {f.name: f for f in report.latency.slow_tools}
+    bloated_by_name = {f.name: f for f in report.response_size.bloated_tools}
 
     for tool in report.tools:
         if not tool.tested:
             lines.append(f"  [skip] {tool.name} — {tool.skip_reason}")
             continue
         slow_flag = slow_by_name.get(tool.name)
+        bloat_flag = bloated_by_name.get(tool.name)
         flags = []
         if tool.crashes:
             flags.append(f"{len(tool.crashes)} crash(es)")
@@ -229,13 +302,17 @@ def render_text(report: Report) -> str:
             flags.append(f"valid call: {tool.valid_call_issue.outcome}")
         if slow_flag:
             flags.append("slow")
-        marker = "FAIL" if (tool.crashes or tool.timeouts) else ("WARN" if (tool.valid_call_issue or slow_flag) else "ok")
+        if bloat_flag:
+            flags.append("bloated")
+        marker = "FAIL" if (tool.crashes or tool.timeouts) else ("WARN" if (tool.valid_call_issue or slow_flag or bloat_flag) else "ok")
         summary = f" — {'; '.join(flags)}" if flags else ""
         lines.append(f"  [{marker}] {tool.name}{summary}")
         for outcome in tool.crashes + tool.timeouts:
             lines.append(f"      {outcome.case} ({outcome.property_name}): {outcome.detail}")
         if slow_flag:
             lines.append(f"      slow — {'; '.join(slow_flag.reasons)}")
+        if bloat_flag:
+            lines.append(f"      bloated — {'; '.join(bloat_flag.reasons)}")
         if tool.valid_call_issue:
             lines.append(
                 f"      valid call — {tool.valid_call_issue.outcome}: {tool.valid_call_issue.detail} "
@@ -247,6 +324,7 @@ def render_text(report: Report) -> str:
 
 def to_dict(report: Report) -> dict:
     slow_by_name = {f.name: f for f in report.latency.slow_tools}
+    bloated_by_name = {f.name: f for f in report.response_size.bloated_tools}
     return {
         "server_command": report.server_command,
         "connect_error": report.connect_error,
@@ -267,6 +345,16 @@ def to_dict(report: Report) -> dict:
                 for f in report.latency.slow_tools
             ],
         },
+        "response_size": {
+            "checked_count": report.response_size.checked_count,
+            "median_chars": report.response_size.median_chars,
+            "percent": report.response_size.percent,
+            "grade": report.response_size.grade,
+            "bloated_tools": [
+                {"name": f.name, "response_chars": f.response_chars, "reasons": f.reasons}
+                for f in report.response_size.bloated_tools
+            ],
+        },
         "tools": [
             {
                 "name": t.name,
@@ -277,7 +365,9 @@ def to_dict(report: Report) -> dict:
                 "valid_call_issue": _outcome_dict(t.valid_call_issue) if t.valid_call_issue else None,
                 "bad_input_case_count": t.bad_input_case_count,
                 "valid_call_duration_ms": t.valid_call_duration_ms,
+                "valid_call_response_chars": t.valid_call_response_chars,
                 "slow": slow_by_name.get(t.name).reasons if t.name in slow_by_name else None,
+                "bloated": bloated_by_name.get(t.name).reasons if t.name in bloated_by_name else None,
             }
             for t in report.tools
         ],

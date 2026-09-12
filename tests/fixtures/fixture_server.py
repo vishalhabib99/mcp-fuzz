@@ -81,5 +81,13 @@ def slow_but_fine(value: str) -> str:
     return value
 
 
+@server.tool(annotations=READ_ONLY)
+def bloated_but_fine(value: str) -> str:
+    """Returns a huge response instantly — not slow, not a crash, only
+    (relative to this fixture server's other tiny-response tools) unusually
+    large by the response-size check."""
+    return value * 10000
+
+
 if __name__ == "__main__":
     server.run(transport="stdio")
