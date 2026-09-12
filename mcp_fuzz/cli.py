@@ -6,7 +6,13 @@ import json
 import sys
 
 from mcp_fuzz.engine import DEFAULT_TIMEOUT_SECONDS, run_fuzz
-from mcp_fuzz.report import LATENCY_ABSOLUTE_SLOW_MS, build_report, render_text, to_dict
+from mcp_fuzz.report import (
+    LATENCY_ABSOLUTE_SLOW_MS,
+    RESPONSE_SIZE_ABSOLUTE_CHARS,
+    build_report,
+    render_text,
+    to_dict,
+)
 from mcp_fuzz.trace import write_jsonl_trace
 
 
@@ -56,6 +62,15 @@ def main() -> None:
         help="exit non-zero if the latency percent is below this threshold",
     )
     parser.add_argument(
+        "--bloat-threshold-chars", type=int, default=RESPONSE_SIZE_ABSOLUTE_CHARS,
+        help=f"flag a tool's valid call as bloated if its response is longer than this, in "
+        f"characters (default {RESPONSE_SIZE_ABSOLUTE_CHARS:,})",
+    )
+    parser.add_argument(
+        "--fail-under-response-size", type=float, default=None,
+        help="exit non-zero if the response-size percent is below this threshold",
+    )
+    parser.add_argument(
         "--full-trace", metavar="PATH", default=None,
         help="also write every call's full detail (tool, case, arguments, outcome, "
         "timing — not just crashes/timeouts) as JSONL to PATH, for feeding a real "
@@ -83,7 +98,9 @@ def main() -> None:
         include_destructive=args.include_destructive,
         timeout=args.timeout,
     ))
-    report = build_report(raw, slow_threshold_ms=args.slow_threshold_ms)
+    report = build_report(
+        raw, slow_threshold_ms=args.slow_threshold_ms, bloat_threshold_chars=args.bloat_threshold_chars,
+    )
 
     if args.full_trace:
         write_jsonl_trace(raw, args.full_trace)
@@ -101,6 +118,10 @@ def main() -> None:
         sys.exit(1)
     if args.fail_under_latency is not None and (
         report.latency.percent is None or report.latency.percent < args.fail_under_latency
+    ):
+        sys.exit(1)
+    if args.fail_under_response_size is not None and (
+        report.response_size.percent is None or report.response_size.percent < args.fail_under_response_size
     ):
         sys.exit(1)
 

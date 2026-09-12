@@ -13,7 +13,14 @@ from pathlib import Path
 import pytest
 
 from mcp_fuzz.engine import CallOutcome, run_fuzz
-from mcp_fuzz.report import LATENCY_ABSOLUTE_SLOW_MS, ToolReport, _compute_latency, build_report
+from mcp_fuzz.report import (
+    LATENCY_ABSOLUTE_SLOW_MS,
+    RESPONSE_SIZE_ABSOLUTE_CHARS,
+    ToolReport,
+    _compute_latency,
+    _compute_response_size,
+    build_report,
+)
 
 FIXTURE_SERVER = str(Path(__file__).parent / "fixtures" / "fixture_server.py")
 
@@ -21,6 +28,12 @@ FIXTURE_SERVER = str(Path(__file__).parent / "fixtures" / "fixture_server.py")
 def _tool(name: str, duration_ms: float, tested: bool = True) -> ToolReport:
     tr = ToolReport(name=name, tested=tested, skip_reason=None)
     tr.valid_call_duration_ms = duration_ms
+    return tr
+
+
+def _sized_tool(name: str, response_chars: int, tested: bool = True) -> ToolReport:
+    tr = ToolReport(name=name, tested=tested, skip_reason=None)
+    tr.valid_call_response_chars = response_chars
     return tr
 
 
@@ -77,6 +90,52 @@ def test_custom_slow_threshold_overrides_default():
     assert _compute_latency(tools, 100.0).slow_tools != []
 
 
+def test_lone_bloated_tool_flagged_by_absolute_threshold():
+    tools = [_sized_tool("bloated_one", RESPONSE_SIZE_ABSOLUTE_CHARS + 1)]
+    summary = _compute_response_size(tools, RESPONSE_SIZE_ABSOLUTE_CHARS)
+    assert summary.checked_count == 1
+    assert [f.name for f in summary.bloated_tools] == ["bloated_one"]
+    assert "absolute threshold" in summary.bloated_tools[0].reasons[0]
+
+
+def test_small_response_under_threshold_not_flagged():
+    tools = [_sized_tool("small_one", 200)]
+    summary = _compute_response_size(tools, RESPONSE_SIZE_ABSOLUTE_CHARS)
+    assert summary.bloated_tools == []
+    assert summary.percent == 100.0
+
+
+def test_relative_size_outlier_flagged_among_otherwise_small_tools():
+    tools = [
+        _sized_tool("small_a", 200), _sized_tool("small_b", 250),
+        _sized_tool("small_c", 220), _sized_tool("outlier", 5000),
+    ]
+    summary = _compute_response_size(tools, RESPONSE_SIZE_ABSOLUTE_CHARS)
+    assert [f.name for f in summary.bloated_tools] == ["outlier"]
+    assert "median" in summary.bloated_tools[0].reasons[0]
+
+
+def test_no_relative_size_outlier_check_below_minimum_sample_size():
+    tools = [_sized_tool("a", 200), _sized_tool("b", 3000)]
+    summary = _compute_response_size(tools, RESPONSE_SIZE_ABSOLUTE_CHARS)
+    assert summary.bloated_tools == []
+
+
+def test_crashed_or_timed_out_valid_call_excluded_from_response_size():
+    tools = [_sized_tool("crashed", 200, tested=True)]
+    tools[0].valid_call_response_chars = None
+    summary = _compute_response_size(tools, RESPONSE_SIZE_ABSOLUTE_CHARS)
+    assert summary.checked_count == 0
+    assert summary.percent is None
+    assert summary.grade is None
+
+
+def test_custom_bloat_threshold_overrides_default():
+    tools = [_sized_tool("borderline", 1000)]
+    assert _compute_response_size(tools, 5000).bloated_tools == []
+    assert _compute_response_size(tools, 500).bloated_tools != []
+
+
 @pytest.fixture(scope="module")
 def fixture_report():
     import asyncio
@@ -94,3 +153,14 @@ def test_fixture_slow_tool_is_flagged_end_to_end(fixture_report):
     slow_names = {f.name for f in report.latency.slow_tools}
     assert "slow_but_fine" in slow_names
     assert "well_behaved" not in slow_names
+
+
+def test_fixture_bloated_tool_is_flagged_end_to_end(fixture_report):
+    # Proves the real engine's actual response length (not a synthetic
+    # value) flows all the way through build_report into a real flag —
+    # bloated_but_fine returns its input repeated 10000x, a clear outlier
+    # against this fixture's other tiny-response tools.
+    report = build_report(fixture_report)
+    bloated_names = {f.name for f in report.response_size.bloated_tools}
+    assert "bloated_but_fine" in bloated_names
+    assert "well_behaved" not in bloated_names

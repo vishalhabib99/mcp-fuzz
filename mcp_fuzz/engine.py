@@ -77,6 +77,12 @@ class CallOutcome:
     arguments: dict = field(default_factory=dict)
     started_at: float = 0.0  # epoch seconds
     duration_ms: float = 0.0
+    # Full (untruncated) character count of the response's joined text
+    # content — unlike `detail` above (truncated to 300 chars for display),
+    # this exists specifically to measure real response size, populated for
+    # any outcome that got a real result back (not a crash/timeout, where
+    # there's no response to measure).
+    response_chars: int = 0
 
 
 @dataclass
@@ -228,12 +234,15 @@ async def _call_with_outcome(
         # the true state rather than papering over a valid-call failure.
         if case == "valid":
             outcome = "valid_call_errored"
-        text = "; ".join(
+        full_text = "; ".join(
             c.text for c in result.content if isinstance(c, types.TextContent)
-        )[:300]
-        return CallOutcome(case, property_name, outcome, text)
+        )
+        return CallOutcome(case, property_name, outcome, full_text[:300], response_chars=len(full_text))
 
-    return CallOutcome(case, property_name, "ok")
+    full_text = "; ".join(
+        c.text for c in result.content if isinstance(c, types.TextContent)
+    ) if isinstance(result, types.CallToolResult) else ""
+    return CallOutcome(case, property_name, "ok", response_chars=len(full_text))
 
 
 def _merged_env(env: dict[str, str] | None) -> dict[str, str] | None:
