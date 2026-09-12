@@ -7,7 +7,9 @@ duration comes from an actual wall-clock measurement, and
 test_fixture_slow_tool_is_flagged_end_to_end below for proof it flows
 through build_report correctly against a real running server."""
 
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -17,12 +19,19 @@ from mcp_fuzz.report import (
     LATENCY_ABSOLUTE_SLOW_MS,
     RESPONSE_SIZE_ABSOLUTE_CHARS,
     ToolReport,
+    _compute_concurrency,
     _compute_latency,
     _compute_response_size,
     build_report,
 )
 
 FIXTURE_SERVER = str(Path(__file__).parent / "fixtures" / "fixture_server.py")
+
+
+def _concurrency_tool(name: str, outcomes: list[str], tested: bool = True) -> ToolReport:
+    tr = ToolReport(name=name, tested=tested, skip_reason=None)
+    tr.concurrent_outcomes = [CallOutcome("valid", None, o) for o in outcomes]
+    return tr
 
 
 def _tool(name: str, duration_ms: float, tested: bool = True) -> ToolReport:
@@ -164,3 +173,55 @@ def test_fixture_bloated_tool_is_flagged_end_to_end(fixture_report):
     bloated_names = {f.name for f in report.response_size.bloated_tools}
     assert "bloated_but_fine" in bloated_names
     assert "well_behaved" not in bloated_names
+
+
+def test_concurrency_not_computed_when_no_tool_was_concurrency_tested():
+    tools = [_tool("a", 50.0)]  # valid_call_duration_ms set, concurrent_outcomes empty
+    summary = _compute_concurrency(tools)
+    assert summary.checked_count == 0
+    assert summary.percent is None
+
+
+def test_tool_that_crashes_under_concurrency_is_flagged():
+    tools = [_concurrency_tool("racy", ["ok", "crash", "ok", "crash"])]
+    summary = _compute_concurrency(tools)
+    assert summary.concurrency == 4
+    assert [f.name for f in summary.flagged_tools] == ["racy"]
+    assert summary.flagged_tools[0].crashes == 2
+    assert summary.percent == 0.0
+
+
+def test_tool_clean_under_concurrency_is_not_flagged():
+    tools = [_concurrency_tool("safe", ["ok", "ok", "ok"])]
+    summary = _compute_concurrency(tools)
+    assert summary.flagged_tools == []
+    assert summary.percent == 100.0
+
+
+def test_concurrency_timeout_is_flagged_same_as_crash():
+    tools = [_concurrency_tool("hangs_sometimes", ["ok", "timeout", "ok"])]
+    summary = _compute_concurrency(tools)
+    assert summary.flagged_tools[0].timeouts == 1
+
+
+@pytest.fixture(scope="module")
+def concurrency_report():
+    import asyncio
+
+    lock_path = os.path.join(tempfile.gettempdir(), "mcp_fuzz_fixture_concurrency_lock")
+    if os.path.exists(lock_path):
+        os.remove(lock_path)  # stale lock from a previous crashed run
+    return asyncio.run(run_fuzz(sys.executable, [FIXTURE_SERVER], timeout=5.0, concurrency=5))
+
+
+def test_fixture_racy_tool_is_flagged_under_real_concurrency(concurrency_report):
+    # Proves the real engine actually launches independent concurrent
+    # connections (not a synthetic outcome list) and that a genuine,
+    # reproducible race — a naive create-exclusive lock file with no
+    # retry/queue handling — gets caught: with 5 concurrent connections all
+    # calling not_concurrency_safe at once, at least one should collide on
+    # the shared lock file and raise FileExistsError.
+    report = build_report(concurrency_report)
+    flagged_names = {f.name for f in report.concurrency.flagged_tools}
+    assert "not_concurrency_safe" in flagged_names
+    assert "well_behaved" not in flagged_names

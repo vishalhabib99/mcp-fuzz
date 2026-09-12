@@ -10,6 +10,8 @@ directly against the installed package, not assumed from older examples.
 
 from __future__ import annotations
 
+import os
+import tempfile
 import time
 
 from mcp.server.mcpserver import MCPServer
@@ -87,6 +89,25 @@ def bloated_but_fine(value: str) -> str:
     (relative to this fixture server's other tiny-response tools) unusually
     large by the response-size check."""
     return value * 10000
+
+
+_LOCK_PATH = os.path.join(tempfile.gettempdir(), "mcp_fuzz_fixture_concurrency_lock")
+
+
+@server.tool(annotations=READ_ONLY)
+def not_concurrency_safe(value: str) -> str:
+    """Uses a naive create-exclusive lock file with no retry/queue handling
+    to serialize access to a shared resource — a real, common (buggy)
+    pattern. Fine when called once at a time; a second call landing while
+    the first is still "holding" the file raises FileExistsError, exactly
+    the kind of shared-state race the concurrency check exists to catch."""
+    fh = open(_LOCK_PATH, "x")
+    try:
+        time.sleep(0.3)
+        return value
+    finally:
+        fh.close()
+        os.remove(_LOCK_PATH)
 
 
 if __name__ == "__main__":

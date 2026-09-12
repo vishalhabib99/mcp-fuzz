@@ -62,6 +62,13 @@ class ToolReport:
     # None for the same reasons as above — a crashed/timed-out call has no
     # real response to measure the size of.
     valid_call_response_chars: int | None = None
+    # Only populated when --concurrency was used — see engine.py's
+    # _run_concurrent_valid_calls. Each entry is one independent
+    # connection's outcome from calling this tool at the same time as the
+    # others; empty (not None) when concurrency testing wasn't requested,
+    # so "tested but concurrency off" and "not tested at all" both read
+    # naturally as "nothing to report" without needing a tri-state check.
+    concurrent_outcomes: list[CallOutcome] = field(default_factory=list)
 
 
 @dataclass
@@ -97,6 +104,25 @@ class ResponseSizeSummary:
 
 
 @dataclass
+class ConcurrencyFlag:
+    name: str
+    crashes: int
+    timeouts: int
+    errors: int
+    concurrency: int
+    reasons: list[str]
+
+
+@dataclass
+class ConcurrencySummary:
+    concurrency: int  # 0 when not requested
+    checked_count: int
+    flagged_tools: list[ConcurrencyFlag]
+    percent: float | None
+    grade: str | None
+
+
+@dataclass
 class Report:
     server_command: str
     connect_error: str | None
@@ -110,6 +136,7 @@ class Report:
     grade: str | None
     latency: LatencySummary
     response_size: ResponseSizeSummary
+    concurrency: ConcurrencySummary
 
 
 def _grade_for_percent(pct: float) -> str:
@@ -145,7 +172,7 @@ def build_report(
             continue
 
         tested_count += 1
-        tr = ToolReport(name=tool.name, tested=True, skip_reason=None)
+        tr = ToolReport(name=tool.name, tested=True, skip_reason=None, concurrent_outcomes=tool.concurrent_outcomes)
         for outcome in tool.outcomes:
             if outcome.case == "valid":
                 if outcome.outcome in ("crash", "timeout", "valid_call_errored"):
@@ -186,6 +213,7 @@ def build_report(
         grade=grade,
         latency=_compute_latency(tool_reports, slow_threshold_ms),
         response_size=_compute_response_size(tool_reports, bloat_threshold_chars),
+        concurrency=_compute_concurrency(tool_reports),
     )
 
 
@@ -245,6 +273,66 @@ def _compute_response_size(tool_reports: list[ToolReport], bloat_threshold_chars
     )
 
 
+def _compute_concurrency(tool_reports: list[ToolReport]) -> ConcurrencySummary:
+    checked = [t for t in tool_reports if t.concurrent_outcomes]
+    if not checked:
+        return ConcurrencySummary(concurrency=0, checked_count=0, flagged_tools=[], percent=None, grade=None)
+
+    concurrency = len(checked[0].concurrent_outcomes)
+    flagged: list[ConcurrencyFlag] = []
+    for t in checked:
+        n = len(t.concurrent_outcomes)
+        crashes = sum(1 for o in t.concurrent_outcomes if o.outcome == "crash")
+        timeouts = sum(1 for o in t.concurrent_outcomes if o.outcome == "timeout")
+        # Every concurrent call uses the identical "valid" arguments, so
+        # unlike the sequential valid-call check elsewhere (where an error
+        # is reported leniently as "maybe a synthetic-input false
+        # positive"), a valid_call_errored outcome here can't be explained
+        # by unrealistic input. Frameworks like FastMCP commonly catch an
+        # application-level exception and return it as a normal
+        # isError:true response rather than a raw crash (verified directly:
+        # the fixture's not_concurrency_safe raising FileExistsError under
+        # real concurrent load surfaces exactly this way, not as "crash")
+        # — treating it as anything less than a real concurrency finding
+        # would silently miss most real bugs this check exists to catch.
+        errors = sum(1 for o in t.concurrent_outcomes if o.outcome == "valid_call_errored")
+        total_failed = crashes + timeouts + errors
+        if total_failed == 0:
+            continue
+        # A tool whose own sequential valid call already failed (already
+        # surfaced by valid_call_issue / the crash-resilience score) failing
+        # the exact same way on every one of N concurrent calls isn't new
+        # information — it's just broken, with or without concurrency.
+        # Only worth a *concurrency* finding when either some concurrent
+        # calls succeeded and others didn't (proves it's load-dependent) or
+        # the tool works fine alone but breaks under concurrent load (a
+        # real deadlock/starvation signature, arguably the more serious of
+        # the two).
+        if t.valid_call_issue is not None and total_failed == n:
+            continue
+
+        reasons = []
+        if crashes:
+            reasons.append(f"{crashes}/{n} concurrent calls crashed")
+        if timeouts:
+            reasons.append(f"{timeouts}/{n} concurrent calls timed out")
+        if errors:
+            if total_failed < n:
+                reasons.append(f"{errors}/{n} concurrent calls errored on input other concurrent calls succeeded with")
+            else:
+                reasons.append(f"{errors}/{n} concurrent calls errored even though this tool's own sequential call succeeds — possible deadlock/starvation under load")
+        flagged.append(ConcurrencyFlag(
+            name=t.name, crashes=crashes, timeouts=timeouts, errors=errors,
+            concurrency=concurrency, reasons=reasons,
+        ))
+
+    percent = 100.0 * (len(checked) - len(flagged)) / len(checked)
+    grade = _grade_for_percent(percent)
+    return ConcurrencySummary(
+        concurrency=concurrency, checked_count=len(checked), flagged_tools=flagged, percent=percent, grade=grade,
+    )
+
+
 def render_text(report: Report) -> str:
     lines: list[str] = []
     if report.connect_error:
@@ -282,10 +370,19 @@ def render_text(report: Report) -> str:
         )
     else:
         lines.append("Response size: n/a (no tool completed a sized valid call)")
+
+    conc = report.concurrency
+    if conc.percent is not None:
+        lines.append(
+            f"Concurrency ({conc.concurrency}x): {conc.percent:.0f}% ({conc.grade}) — "
+            f"{len(conc.flagged_tools)} tool(s) crashed or timed out under concurrent load "
+            f"out of {conc.checked_count} checked"
+        )
     lines.append("")
 
     slow_by_name = {f.name: f for f in report.latency.slow_tools}
     bloated_by_name = {f.name: f for f in report.response_size.bloated_tools}
+    concurrency_by_name = {f.name: f for f in report.concurrency.flagged_tools}
 
     for tool in report.tools:
         if not tool.tested:
@@ -293,6 +390,7 @@ def render_text(report: Report) -> str:
             continue
         slow_flag = slow_by_name.get(tool.name)
         bloat_flag = bloated_by_name.get(tool.name)
+        concurrency_flag = concurrency_by_name.get(tool.name)
         flags = []
         if tool.crashes:
             flags.append(f"{len(tool.crashes)} crash(es)")
@@ -304,7 +402,9 @@ def render_text(report: Report) -> str:
             flags.append("slow")
         if bloat_flag:
             flags.append("bloated")
-        marker = "FAIL" if (tool.crashes or tool.timeouts) else ("WARN" if (tool.valid_call_issue or slow_flag or bloat_flag) else "ok")
+        if concurrency_flag:
+            flags.append("unsafe under concurrency")
+        marker = "FAIL" if (tool.crashes or tool.timeouts or concurrency_flag) else ("WARN" if (tool.valid_call_issue or slow_flag or bloat_flag) else "ok")
         summary = f" — {'; '.join(flags)}" if flags else ""
         lines.append(f"  [{marker}] {tool.name}{summary}")
         for outcome in tool.crashes + tool.timeouts:
@@ -313,6 +413,8 @@ def render_text(report: Report) -> str:
             lines.append(f"      slow — {'; '.join(slow_flag.reasons)}")
         if bloat_flag:
             lines.append(f"      bloated — {'; '.join(bloat_flag.reasons)}")
+        if concurrency_flag:
+            lines.append(f"      unsafe under concurrency — {'; '.join(concurrency_flag.reasons)}")
         if tool.valid_call_issue:
             lines.append(
                 f"      valid call — {tool.valid_call_issue.outcome}: {tool.valid_call_issue.detail} "
@@ -325,6 +427,7 @@ def render_text(report: Report) -> str:
 def to_dict(report: Report) -> dict:
     slow_by_name = {f.name: f for f in report.latency.slow_tools}
     bloated_by_name = {f.name: f for f in report.response_size.bloated_tools}
+    concurrency_by_name = {f.name: f for f in report.concurrency.flagged_tools}
     return {
         "server_command": report.server_command,
         "connect_error": report.connect_error,
@@ -355,6 +458,16 @@ def to_dict(report: Report) -> dict:
                 for f in report.response_size.bloated_tools
             ],
         },
+        "concurrency": {
+            "concurrency": report.concurrency.concurrency,
+            "checked_count": report.concurrency.checked_count,
+            "percent": report.concurrency.percent,
+            "grade": report.concurrency.grade,
+            "flagged_tools": [
+                {"name": f.name, "crashes": f.crashes, "timeouts": f.timeouts, "errors": f.errors, "reasons": f.reasons}
+                for f in report.concurrency.flagged_tools
+            ],
+        },
         "tools": [
             {
                 "name": t.name,
@@ -368,6 +481,7 @@ def to_dict(report: Report) -> dict:
                 "valid_call_response_chars": t.valid_call_response_chars,
                 "slow": slow_by_name.get(t.name).reasons if t.name in slow_by_name else None,
                 "bloated": bloated_by_name.get(t.name).reasons if t.name in bloated_by_name else None,
+                "concurrency_unsafe": concurrency_by_name.get(t.name).reasons if t.name in concurrency_by_name else None,
             }
             for t in report.tools
         ],
