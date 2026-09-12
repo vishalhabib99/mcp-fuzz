@@ -32,7 +32,7 @@ def test_connects_and_lists_all_five_tools(fuzz_report):
     names = {t.name for t in fuzz_report.tools}
     assert names == {
         "well_behaved", "crashes_on_bad_input", "hangs_forever",
-        "delete_everything", "always_crashes", "kills_process",
+        "delete_everything", "always_crashes", "kills_process", "slow_but_fine",
     }
 
 
