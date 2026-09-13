@@ -8,7 +8,7 @@ Runtime behavioral testing for [MCP](https://modelcontextprotocol.io) servers.
 
 [`mcp-doctor`](https://github.com/vishalhabib99/mcp-doctor) reads an MCP server's *source code* and checks whether its tools are well-documented. `mcp-fuzz` does the opposite: it actually **launches the server and calls its tools**, with inputs derived from each tool's own declared JSON schema, and checks whether the server behaves the way that schema and its description claim — does a missing required field get a structured error back, or does the server crash? Does a wrong-typed field get rejected cleanly, or does it hang?
 
-Static analysis can't see any of that. Only running the code can. It also measures things static analysis structurally can't: how long each tool actually takes to respond ([Latency check](#latency-check)), how large its response actually is ([Response size check](#response-size-check)), and, opt-in, whether it behaves correctly when several callers hit it at once ([Concurrency check](#concurrency-check--opt-in)).
+Static analysis can't see any of that. Only running the code can. It also measures things static analysis structurally can't: how long each tool actually takes to respond ([Latency check](#latency-check)), how large its response actually is ([Response size check](#response-size-check)), whether it behaves correctly when several callers hit it at once ([Concurrency check](#concurrency-check--opt-in)), and, opt-in, whether a resource actually stays deleted once a tool says it deleted it ([Resource lifecycle check](#resource-lifecycle-check--opt-in-chains-a-real-id)).
 
 It still deliberately stops short of judging whether a *successful* call's response is actually correct — a schema-only placeholder value usually isn't realistic enough to fairly judge that. [`mcp-reality-check`](https://github.com/vishalhabib99/mcp-reality-check) is the third tool in the family that picks up exactly that: does it fail safely, and does it actually work.
 
@@ -106,6 +106,23 @@ A tool whose sequential call *also* already fails, failing the exact same way on
 
 Note on how a failure actually shows up: an application-level exception raised inside a tool handler is commonly caught by the server's own framework (FastMCP, for one, verified directly) and returned as a normal `isError: true` response, not a raw crash — this check treats that the same as a crash/timeout when it happens under concurrent load, since excluding it would silently miss most real concurrency bugs.
 
+## Resource lifecycle check — opt-in, chains a real id
+
+Everything above tests one tool call in isolation, always with synthetic, schema-derived arguments — even a `get_item`-shaped tool is called with a placeholder id that was never actually created. That structurally can't catch a real and common bug class: does a tool behave correctly on a resource another tool *actually* created, and — the more interesting case — does a "deleted" resource stay deleted?
+
+`--sequential` (requires `--include-destructive`, since it creates and deletes real data) looks for `create_X`/`get_X`/`delete_X`-shaped tool names sharing the same resource (also recognizes `add`/`insert`/`new`, `read`/`fetch`/`retrieve`/`describe`/`show`, `remove`/`destroy`). For each group found:
+
+1. Calls `create_X` with a normal schema-derived valid call.
+2. Extracts a real id from the real response (a JSON `id`/`{resource}_id`/`uuid` field, or a bare UUID in plain text) — gives up cleanly rather than guessing if nothing id-shaped is found.
+3. Calls `get_X`/`delete_X` with that **real** id in place of a synthetic one.
+4. If both a read and a delete tool exist, re-calls `get_X` with the same id *after* deletion — a **stale read**: `get_X` still reporting success on an id `delete_X` just removed — is the specific finding this check exists to catch.
+
+```bash
+mcp-fuzz --include-destructive --sequential -- python server.py
+```
+
+Off by default, same reasoning as `--concurrency`: it's strictly more destructive than testing a single write tool alone (it creates *and* deletes a real resource). The resource grouping is a deliberately conservative name heuristic — same discipline as this project's other name-based checks — and gives up rather than guessing on anything ambiguous: two `create_`-shaped tools for the same resource name, no id-shaped field anywhere in a create response, or a dependent tool whose schema doesn't have an unambiguous id-shaped or sole-required-string property. A server whose create/read/delete tools don't follow this naming convention, or whose id isn't returned in the response body at all, produces zero detected groups — reported plainly as "0 groups detected," not treated as a pass.
+
 ## Full-fidelity trace export
 
 `--json`'s report is deliberately narrow — it exists to answer "what's the crash-resilience score," so it drops every "ok" outcome, the call arguments, and any timing. That's the right shape for the score, wrong shape for reconstructing what a run actually did call by call — useful if you want to feed a real session into an external evidence or trajectory-debugging tool.
@@ -178,6 +195,7 @@ Fixed by treating any of these the same way the rest of the module already treat
 - Input generation is schema-only. A property with no `type` (or a genuinely ambiguous `anyOf`) is skipped from the wrong-type test set rather than guessed at.
 - No semantic check of *what* a successful response actually contains — that's a deliberately separate, opt-in, LLM-backed capability planned for a later release, not v1.
 - stdio transport only for now; no HTTP/SSE servers yet.
+- The resource-lifecycle check (`--sequential`) only chains a single create → read/delete step per detected group, not an arbitrary multi-step plan across several different resources — a real bug in a longer, cross-resource workflow (an agent's actual multi-tool plan, not just one resource's own lifecycle) is out of scope for this check specifically.
 
 ## License
 

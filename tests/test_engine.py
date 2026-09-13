@@ -34,6 +34,8 @@ def test_connects_and_lists_all_five_tools(fuzz_report):
         "well_behaved", "crashes_on_bad_input", "hangs_forever",
         "delete_everything", "always_crashes", "kills_process", "slow_but_fine",
         "bloated_but_fine", "not_concurrency_safe",
+        "create_item", "get_item", "delete_item",
+        "create_ticket", "get_ticket", "delete_ticket",
     }
 
 
@@ -91,8 +93,13 @@ def test_report_scores_crash_resilience_without_penalizing_valid_call_errors(fuz
     assert report.timeout_count == 0
     # The valid-call issues (timeout, SDK-caught error, real crash) are
     # real and surfaced, just not folded into the bad-input crash score.
+    # get_item/get_ticket are the same documented synthetic-input false
+    # positive as everywhere else in this project: their schema-derived
+    # "valid" call uses a placeholder id string that was never actually
+    # created via create_item/create_ticket in this (non-sequential) run,
+    # so the real, correct-behavior lookup miss surfaces as valid_call_errored.
     flagged = [t for t in report.tools if t.valid_call_issue is not None]
-    assert {t.name for t in flagged} == {"hangs_forever", "always_crashes", "kills_process"}
+    assert {t.name for t in flagged} == {"hangs_forever", "always_crashes", "kills_process", "get_item", "get_ticket"}
 
 
 ENV_REQUIRED_SERVER = str(Path(__file__).parent / "fixtures" / "env_required_server.py")

@@ -83,6 +83,15 @@ def main() -> None:
         help="exit non-zero if the concurrency percent is below this threshold",
     )
     parser.add_argument(
+        "--sequential", action="store_true",
+        help="also chain a real id: for any create_X/get_X/delete_X-shaped tool group detected "
+        "by name, create a real resource, read and delete it using the id the create call "
+        "actually returned (not synthetic per-tool arguments), then re-read the same id after "
+        "deletion to check for a stale read (the resource still reads as present after being "
+        "deleted). Requires --include-destructive — a lifecycle check by definition creates "
+        "and deletes real data. Off by default; see README before turning this on.",
+    )
+    parser.add_argument(
         "--full-trace", metavar="PATH", default=None,
         help="also write every call's full detail (tool, case, arguments, outcome, "
         "timing — not just crashes/timeouts) as JSONL to PATH, for feeding a real "
@@ -94,6 +103,8 @@ def main() -> None:
     command_parts = [c for c in args.command if c != "--"]
     if not command_parts:
         parser.error("no server command given — e.g. `mcp-fuzz -- python server.py`")
+    if args.sequential and not args.include_destructive:
+        parser.error("--sequential requires --include-destructive (it creates and deletes real data)")
 
     env = {}
     for pair in args.env:
@@ -110,6 +121,7 @@ def main() -> None:
         include_destructive=args.include_destructive,
         timeout=args.timeout,
         concurrency=args.concurrency,
+        sequential=args.sequential,
     ))
     report = build_report(
         raw, slow_threshold_ms=args.slow_threshold_ms, bloat_threshold_chars=args.bloat_threshold_chars,
