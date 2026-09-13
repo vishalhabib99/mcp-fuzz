@@ -10,9 +10,11 @@ directly against the installed package, not assumed from older examples.
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import time
+import uuid
 
 from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
@@ -108,6 +110,67 @@ def not_concurrency_safe(value: str) -> str:
     finally:
         fh.close()
         os.remove(_LOCK_PATH)
+
+
+_ITEMS: dict[str, dict] = {}
+
+
+@server.tool(annotations=NOT_READ_ONLY)
+def create_item(name: str) -> str:
+    """Creates an item and returns its id as JSON — part of a well-behaved
+    create/get/delete trio for the --sequential check to exercise."""
+    item_id = str(uuid.uuid4())
+    _ITEMS[item_id] = {"id": item_id, "name": name}
+    return json.dumps(_ITEMS[item_id])
+
+
+@server.tool(annotations=READ_ONLY)
+def get_item(item_id: str) -> str:
+    """Reads an item by id — errors if it doesn't exist (including after a
+    real delete_item call), the correctly-behaved case."""
+    if item_id not in _ITEMS:
+        raise ValueError(f"no item with id {item_id}")
+    return json.dumps(_ITEMS[item_id])
+
+
+@server.tool(annotations=NOT_READ_ONLY)
+def delete_item(item_id: str) -> str:
+    """Deletes an item by id for real."""
+    _ITEMS.pop(item_id, None)
+    return f"deleted {item_id}"
+
+
+_TICKETS: dict[str, dict] = {}
+
+
+@server.tool(annotations=NOT_READ_ONLY)
+def create_ticket(title: str) -> str:
+    """Creates a ticket and returns its id as JSON — part of a deliberately
+    buggy create/get/delete trio (delete_ticket reports success but never
+    actually removes it), to verify the --sequential check's stale-after-
+    delete detection catches a real instance of the bug it exists for."""
+    ticket_id = str(uuid.uuid4())
+    _TICKETS[ticket_id] = {"id": ticket_id, "title": title}
+    return json.dumps(_TICKETS[ticket_id])
+
+
+@server.tool(annotations=READ_ONLY)
+def get_ticket(ticket_id: str) -> str:
+    """Reads a ticket by id."""
+    if ticket_id not in _TICKETS:
+        raise ValueError(f"no ticket with id {ticket_id}")
+    return json.dumps(_TICKETS[ticket_id])
+
+
+@server.tool(annotations=NOT_READ_ONLY)
+def delete_ticket(ticket_id: str) -> str:
+    """Deliberately buggy: validates the ticket exists and reports success,
+    but never actually removes it from the store — get_ticket will still
+    succeed afterward. This is the exact stale-read bug shape --sequential
+    exists to catch, reproduced here on purpose rather than left to chance."""
+    if ticket_id not in _TICKETS:
+        raise ValueError(f"no ticket with id {ticket_id}")
+    return f"deleted {ticket_id}"
 
 
 if __name__ == "__main__":

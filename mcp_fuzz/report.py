@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from mcp_fuzz.engine import CallOutcome, FuzzReport, ToolResult
+from mcp_fuzz.engine import CallOutcome, FuzzReport, SequenceResult, ToolResult
 
 BAD_INPUT_CASES = {"missing_required", "wrong_type"}
 
@@ -123,6 +123,18 @@ class ConcurrencySummary:
 
 
 @dataclass
+class SequenceSummary:
+    # Not scored with a percent/grade like the checks above — there's no
+    # natural denominator (a server with zero detected create/read/delete
+    # groups isn't "failing", it just has nothing this check can exercise).
+    # Binary and explicit instead: how many groups were found, how many
+    # produced a real stale-read finding.
+    groups_detected: int
+    stale_after_delete_count: int
+    groups: list[SequenceResult]
+
+
+@dataclass
 class Report:
     server_command: str
     connect_error: str | None
@@ -137,6 +149,7 @@ class Report:
     latency: LatencySummary
     response_size: ResponseSizeSummary
     concurrency: ConcurrencySummary
+    sequence: SequenceSummary
 
 
 def _grade_for_percent(pct: float) -> str:
@@ -214,7 +227,13 @@ def build_report(
         latency=_compute_latency(tool_reports, slow_threshold_ms),
         response_size=_compute_response_size(tool_reports, bloat_threshold_chars),
         concurrency=_compute_concurrency(tool_reports),
+        sequence=_compute_sequence(raw.sequence_results),
     )
+
+
+def _compute_sequence(groups: list[SequenceResult]) -> SequenceSummary:
+    stale_count = sum(1 for g in groups if g.stale_after_delete)
+    return SequenceSummary(groups_detected=len(groups), stale_after_delete_count=stale_count, groups=groups)
 
 
 def _median(values: list[float]) -> float:
@@ -378,6 +397,13 @@ def render_text(report: Report) -> str:
             f"{len(conc.flagged_tools)} tool(s) crashed or timed out under concurrent load "
             f"out of {conc.checked_count} checked"
         )
+
+    seq = report.sequence
+    if seq.groups_detected > 0:
+        lines.append(
+            f"Resource lifecycle: {seq.groups_detected} create/read/delete group(s) detected, "
+            f"{seq.stale_after_delete_count} stale-after-delete finding(s)"
+        )
     lines.append("")
 
     slow_by_name = {f.name: f for f in report.latency.slow_tools}
@@ -420,6 +446,16 @@ def render_text(report: Report) -> str:
                 f"      valid call — {tool.valid_call_issue.outcome}: {tool.valid_call_issue.detail} "
                 "(may be a synthetic-input false positive, not a confirmed bug — see README)"
             )
+
+    if seq.groups_detected > 0:
+        lines.append("")
+        lines.append("Resource lifecycle (real id chained from create into read/delete):")
+        for g in seq.groups:
+            marker = "FAIL" if g.stale_after_delete else "ok"
+            chain = " -> ".join(s.tool for s in g.steps)
+            lines.append(f"  [{marker}] {g.resource}: {chain}")
+            if g.note:
+                lines.append(f"      {g.note}")
 
     return "\n".join(lines)
 
@@ -466,6 +502,26 @@ def to_dict(report: Report) -> dict:
             "flagged_tools": [
                 {"name": f.name, "crashes": f.crashes, "timeouts": f.timeouts, "errors": f.errors, "reasons": f.reasons}
                 for f in report.concurrency.flagged_tools
+            ],
+        },
+        "sequence": {
+            "groups_detected": report.sequence.groups_detected,
+            "stale_after_delete_count": report.sequence.stale_after_delete_count,
+            "groups": [
+                {
+                    "resource": g.resource,
+                    "create_tool": g.create_tool,
+                    "read_tool": g.read_tool,
+                    "delete_tool": g.delete_tool,
+                    "extracted_id": g.extracted_id,
+                    "stale_after_delete": g.stale_after_delete,
+                    "note": g.note,
+                    "steps": [
+                        {"tool": s.tool, "role": s.role, "outcome": _outcome_dict(s.outcome)}
+                        for s in g.steps
+                    ],
+                }
+                for g in report.sequence.groups
             ],
         },
         "tools": [

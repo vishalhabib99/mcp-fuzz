@@ -60,6 +60,7 @@ from mcp_fuzz.generator import (
     missing_required_variants,
     wrong_type_variants,
 )
+from mcp_fuzz.sequence import extract_id, find_id_property, group_resource_tools
 
 DEFAULT_TIMEOUT_SECONDS = 15.0
 
@@ -83,6 +84,11 @@ class CallOutcome:
     # any outcome that got a real result back (not a crash/timeout, where
     # there's no response to measure).
     response_chars: int = 0
+    # The full (untruncated) response text itself, same population rule as
+    # response_chars above — exists specifically for the sequential check
+    # to extract a real resource id from, where a 300-char truncation could
+    # cut off the id field on a verbose create response.
+    full_text: str = ""
 
 
 @dataclass
@@ -103,10 +109,34 @@ class ToolResult:
 
 
 @dataclass
+class SequenceStep:
+    tool: str
+    role: str  # "create" | "read" | "delete" | "read_after_delete"
+    outcome: CallOutcome
+
+
+@dataclass
+class SequenceResult:
+    resource: str
+    create_tool: str
+    read_tool: str | None
+    delete_tool: str | None
+    steps: list[SequenceStep] = field(default_factory=list)
+    extracted_id: str | None = None
+    stale_after_delete: bool = False
+    note: str = ""
+
+
+@dataclass
 class FuzzReport:
     server_command: str
     tools: list[ToolResult] = field(default_factory=list)
     connect_error: str | None = None
+    # Populated only when sequential=True in run_fuzz — see
+    # _run_sequence_checks. Each entry is one detected create/read/delete
+    # resource group, chained with a real id from the real create response
+    # rather than independent synthetic calls like everything else here.
+    sequence_results: list[SequenceResult] = field(default_factory=list)
 
 
 class _ServerConnection:
@@ -246,12 +276,12 @@ async def _call_with_outcome(
         full_text = "; ".join(
             c.text for c in result.content if isinstance(c, types.TextContent)
         )
-        return CallOutcome(case, property_name, outcome, full_text[:300], response_chars=len(full_text))
+        return CallOutcome(case, property_name, outcome, full_text[:300], response_chars=len(full_text), full_text=full_text)
 
     full_text = "; ".join(
         c.text for c in result.content if isinstance(c, types.TextContent)
     ) if isinstance(result, types.CallToolResult) else ""
-    return CallOutcome(case, property_name, "ok", response_chars=len(full_text))
+    return CallOutcome(case, property_name, "ok", response_chars=len(full_text), full_text=full_text)
 
 
 def _merged_env(env: dict[str, str] | None) -> dict[str, str] | None:
@@ -297,6 +327,93 @@ async def _run_concurrent_valid_calls(
     return list(await asyncio.gather(*(_one_call() for _ in range(concurrency))))
 
 
+async def _run_sequence_checks(
+    conn: _ServerConnection,
+    params: StdioServerParameters,
+    tools: list[types.Tool],
+    timeout: float,
+) -> list[SequenceResult]:
+    """For each detected create/read/delete resource group (see
+    mcp_fuzz.sequence.group_resource_tools), creates a real resource, chains
+    the real id it returns into the read/delete calls (instead of each
+    tool's own independent synthetic arguments), and — when both a read and
+    a delete tool exist — re-reads the same id after deletion to check for
+    a stale read: the read tool still reporting success on a resource that
+    was just removed. That specific check is the reason this exists; every
+    other call above it is necessary setup, not the finding itself."""
+    tools_by_name = {t.name: t for t in tools}
+    groups = group_resource_tools([t.name for t in tools])
+    results: list[SequenceResult] = []
+
+    for group in groups:
+        result = SequenceResult(
+            resource=group.resource, create_tool=group.create_tool,
+            read_tool=group.read_tool, delete_tool=group.delete_tool,
+        )
+
+        create_schema = _field(tools_by_name[group.create_tool], "input_schema", "inputSchema")
+        create_args = generate_valid_arguments(create_schema)
+        create_outcome = await _call_with_outcome(conn, params, group.create_tool, "valid", None, create_args, timeout)
+        result.steps.append(SequenceStep(tool=group.create_tool, role="create", outcome=create_outcome))
+
+        if create_outcome.outcome != "ok":
+            result.note = f"create call did not succeed ({create_outcome.outcome}) — sequence stops here"
+            results.append(result)
+            continue
+
+        extracted = extract_id(create_outcome.full_text, group.resource)
+        if extracted is None:
+            result.note = "create call succeeded but no id could be extracted from its response — sequence stops here"
+            results.append(result)
+            continue
+        result.extracted_id = extracted
+
+        read_schema = None
+        read_id_prop = None
+        pre_delete_read_ok = False
+        if group.read_tool:
+            read_schema = _field(tools_by_name[group.read_tool], "input_schema", "inputSchema")
+            read_id_prop = find_id_property(read_schema, group.resource)
+            if read_id_prop is None:
+                result.note = f"could not determine which parameter on {group.read_tool} identifies the resource — skipping read step(s)"
+            else:
+                read_args = generate_valid_arguments(read_schema)
+                read_args[read_id_prop] = extracted
+                read_outcome = await _call_with_outcome(conn, params, group.read_tool, "valid", None, read_args, timeout)
+                result.steps.append(SequenceStep(tool=group.read_tool, role="read", outcome=read_outcome))
+                pre_delete_read_ok = read_outcome.outcome == "ok"
+
+        if group.delete_tool:
+            delete_schema = _field(tools_by_name[group.delete_tool], "input_schema", "inputSchema")
+            delete_id_prop = find_id_property(delete_schema, group.resource)
+            if delete_id_prop is None:
+                note = f"could not determine which parameter on {group.delete_tool} identifies the resource — skipping delete step"
+                result.note = f"{result.note}; {note}" if result.note else note
+            else:
+                delete_args = generate_valid_arguments(delete_schema)
+                delete_args[delete_id_prop] = extracted
+                delete_outcome = await _call_with_outcome(conn, params, group.delete_tool, "valid", None, delete_args, timeout)
+                result.steps.append(SequenceStep(tool=group.delete_tool, role="delete", outcome=delete_outcome))
+
+                if delete_outcome.outcome == "ok" and read_id_prop is not None:
+                    read_args = generate_valid_arguments(read_schema)
+                    read_args[read_id_prop] = extracted
+                    post_delete_outcome = await _call_with_outcome(
+                        conn, params, group.read_tool, "valid", None, read_args, timeout,
+                    )
+                    result.steps.append(SequenceStep(tool=group.read_tool, role="read_after_delete", outcome=post_delete_outcome))
+                    if post_delete_outcome.outcome == "ok":
+                        result.stale_after_delete = True
+                        result.note = (
+                            f"{group.read_tool} still returned success reading the id {group.delete_tool} "
+                            f"just deleted{' (also succeeded before deletion, so this is a real change)' if pre_delete_read_ok else ''}"
+                        )
+
+        results.append(result)
+
+    return results
+
+
 async def run_fuzz(
     command: str,
     args: list[str] | None = None,
@@ -305,6 +422,7 @@ async def run_fuzz(
     include_destructive: bool = False,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
     concurrency: int = 0,
+    sequential: bool = False,
 ) -> FuzzReport:
     merged_env = _merged_env(env)
     params = StdioServerParameters(command=command, args=args or [], env=merged_env, cwd=cwd)
@@ -370,6 +488,15 @@ async def run_fuzz(
             )
 
         report.tools.append(result)
+
+    if sequential and include_destructive:
+        # Requires include_destructive: a resource-lifecycle check by
+        # definition creates and deletes a real resource, strictly more
+        # destructive than testing a single write tool in isolation — never
+        # run implicitly just because --sequential was passed.
+        report.sequence_results = await _run_sequence_checks(
+            conn, params, tools_result.tools, timeout,
+        )
 
     await conn.close()
     return report
