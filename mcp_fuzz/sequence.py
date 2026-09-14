@@ -10,6 +10,16 @@ returned>)` behave correctly, and — the more interesting case — does
 ("stale read")? Testing that needs a *real* id chained from one call's
 response into the next, which nothing else in this package attempts.
 
+A second, related gap: even a full create/read/delete chain only ever
+exercises one resource type in isolation. A common real bug lives between
+two resources instead — `create_task(project_id=...)` referencing a
+`project`, then `delete_project` running with no idea `task` ever existed.
+Whether the task should still be readable afterward is a real design
+choice (cascade vs. orphan-allowed), not something this module judges —
+`find_parent_child_pairs` below only detects the relationship so the engine
+can chain a real workflow across it and report what actually happens as a
+neutral observation, not a pass/fail verdict.
+
 Deliberately conservative: every heuristic below either finds an
 unambiguous match or gives up and reports why, rather than guessing. A wrong
 guess here would call a real tool with a fabricated argument shape, not just
@@ -147,3 +157,54 @@ def find_id_property(schema: dict[str, Any] | None, resource: str) -> str | None
     if len(required_string_props) == 1:
         return required_string_props[0]
     return None
+
+
+@dataclass
+class ParentChildPair:
+    parent: ResourceGroup
+    child: ResourceGroup
+    parent_link_property: str
+
+
+def find_parent_link_property(child_create_schema: dict[str, Any] | None, parent_resource: str) -> str | None:
+    """Whether a child resource's create call takes the parent's id as one
+    of its own arguments — exact-name match only (`{parent_resource}_id`),
+    deliberately with **no** fallback to a sole-required-string property the
+    way `find_id_property` has for a get/delete call. A create call commonly
+    has several required fields at once (a title, a name, *and* the foreign
+    key) — guessing which one is the parent link among those would be
+    exactly the kind of wrong guess this module exists to avoid, unlike a
+    get/delete call, which usually takes just the id and little else."""
+    if not isinstance(child_create_schema, dict):
+        return None
+    properties = child_create_schema.get("properties", {})
+    if not isinstance(properties, dict):
+        return None
+    candidate = f"{parent_resource}_id"
+    return candidate if candidate in properties else None
+
+
+def find_parent_child_pairs(
+    groups: list[ResourceGroup], create_schemas: dict[str, dict[str, Any] | None],
+) -> list[ParentChildPair]:
+    """Detects which already-identified resource groups (see
+    `group_resource_tools`) reference another as a parent, restricted to
+    pairs where the cross-resource workflow this exists to drive is actually
+    runnable: the parent must have a delete tool (the workflow deletes it)
+    and the child must have a read tool (the workflow checks whether it's
+    still readable afterward). Within that, a pair is only reported when
+    exactly one property on the child's create schema names the parent
+    (`{parent_resource}_id`) — everything else (zero matches, or the same
+    child linking to more than one plausible parent by that name) isn't
+    guessed at, it's just not a pair."""
+    pairs: list[ParentChildPair] = []
+    for parent in groups:
+        if parent.delete_tool is None:
+            continue
+        for child in groups:
+            if child is parent or child.read_tool is None:
+                continue
+            link = find_parent_link_property(create_schemas.get(child.create_tool), parent.resource)
+            if link is not None:
+                pairs.append(ParentChildPair(parent=parent, child=child, parent_link_property=link))
+    return pairs

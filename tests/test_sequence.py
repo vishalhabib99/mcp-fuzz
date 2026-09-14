@@ -11,7 +11,14 @@ import pytest
 
 from mcp_fuzz.engine import run_fuzz
 from mcp_fuzz.report import build_report
-from mcp_fuzz.sequence import extract_id, find_id_property, group_resource_tools
+from mcp_fuzz.sequence import (
+    ResourceGroup,
+    extract_id,
+    find_id_property,
+    find_parent_child_pairs,
+    find_parent_link_property,
+    group_resource_tools,
+)
 
 FIXTURE_SERVER = str(Path(__file__).parent / "fixtures" / "fixture_server.py")
 
@@ -106,6 +113,57 @@ def test_gives_up_when_multiple_required_string_properties_and_no_exact_match():
     assert find_id_property(schema, "item") is None
 
 
+# --- find_parent_link_property ------------------------------------------------
+
+def test_finds_exact_parent_id_property():
+    schema = {"properties": {"project_id": {"type": "string"}, "title": {"type": "string"}}, "required": ["project_id", "title"]}
+    assert find_parent_link_property(schema, "project") == "project_id"
+
+
+def test_no_fallback_to_sole_required_string_property_for_parent_link():
+    # Unlike find_id_property, a create call commonly has several required
+    # fields — a bare match on "the one required string" would be a guess
+    # about which one is the foreign key, not a real signal.
+    schema = {"properties": {"ref": {"type": "string"}}, "required": ["ref"]}
+    assert find_parent_link_property(schema, "project") is None
+
+
+def test_returns_none_when_no_matching_property():
+    schema = {"properties": {"title": {"type": "string"}}, "required": ["title"]}
+    assert find_parent_link_property(schema, "project") is None
+
+
+# --- find_parent_child_pairs ---------------------------------------------------
+
+_PROJECT = ResourceGroup(resource="project", create_tool="create_project", read_tool=None, delete_tool="delete_project")
+_TASK = ResourceGroup(resource="task", create_tool="create_task", read_tool="get_task", delete_tool=None)
+_TICKET = ResourceGroup(resource="ticket", create_tool="create_ticket", read_tool="get_ticket", delete_tool="delete_ticket")
+
+
+def test_detects_a_real_parent_child_pair():
+    schemas = {"create_task": {"properties": {"project_id": {"type": "string"}, "title": {"type": "string"}}}}
+    pairs = find_parent_child_pairs([_PROJECT, _TASK], schemas)
+    assert len(pairs) == 1
+    assert (pairs[0].parent.resource, pairs[0].child.resource, pairs[0].parent_link_property) == ("project", "task", "project_id")
+
+
+def test_parent_without_a_delete_tool_is_not_considered():
+    parent_no_delete = ResourceGroup(resource="project", create_tool="create_project", read_tool="get_project", delete_tool=None)
+    schemas = {"create_task": {"properties": {"project_id": {"type": "string"}}}}
+    assert find_parent_child_pairs([parent_no_delete, _TASK], schemas) == []
+
+
+def test_child_without_a_read_tool_is_not_considered():
+    child_no_read = ResourceGroup(resource="task", create_tool="create_task", read_tool=None, delete_tool="delete_task")
+    schemas = {"create_task": {"properties": {"project_id": {"type": "string"}}}}
+    assert find_parent_child_pairs([_PROJECT, child_no_read], schemas) == []
+
+
+def test_unrelated_groups_produce_no_pairs():
+    schemas = {"create_ticket": {"properties": {"title": {"type": "string"}}}}
+    assert find_parent_child_pairs([_PROJECT, _TICKET], schemas) == []
+
+
 # --- end-to-end: real engine against the real fixture server -----------------
 
 @pytest.fixture(scope="module")
@@ -145,5 +203,47 @@ def test_buggy_trio_is_caught_as_stale_after_delete(sequential_report):
 
 def test_report_summarizes_the_sequence_findings(sequential_report):
     report = build_report(sequential_report)
-    assert report.sequence.groups_detected == 2
+    # item, ticket (full trios) plus project, task, team, member (each forms
+    # its own single-resource group too, since every one of them has either
+    # a delete or a read tool of its own) — six total, only ticket is stale.
+    assert report.sequence.groups_detected == 6
     assert report.sequence.stale_after_delete_count == 1
+
+
+# --- end-to-end cross-resource: real engine against the real fixture server --
+
+def _pair(report, child_resource):
+    return next(r for r in report.cross_resource_results if r.child_resource == child_resource)
+
+
+def test_detects_both_real_parent_child_pairs(sequential_report):
+    assert len(sequential_report.cross_resource_results) == 2
+    resources = {(r.parent_resource, r.child_resource) for r in sequential_report.cross_resource_results}
+    assert resources == {("project", "task"), ("team", "member")}
+
+
+def test_buggy_pair_flags_child_still_readable_after_parent_delete(sequential_report):
+    # The actual bug this check exists to catch: delete_project has no idea
+    # tasks exist, so get_task still succeeds on a task whose project is gone.
+    r = _pair(sequential_report, "task")
+    assert r.parent_id is not None
+    assert r.child_id is not None
+    assert r.child_readable_after_parent_delete is True
+    assert r.steps[-1].role == "read_child_after_parent_delete"
+    assert r.steps[-1].outcome.outcome == "ok"
+    assert "worth confirming" in r.note
+
+
+def test_cascading_pair_is_not_flagged(sequential_report):
+    r = _pair(sequential_report, "member")
+    assert r.parent_id is not None
+    assert r.child_id is not None
+    assert r.child_readable_after_parent_delete is False
+    assert r.steps[-1].outcome.outcome != "ok"
+    assert r.note == ""
+
+
+def test_report_summarizes_the_cross_resource_findings(sequential_report):
+    report = build_report(sequential_report)
+    assert report.cross_resource.pairs_detected == 2
+    assert report.cross_resource.orphaned_child_count == 1

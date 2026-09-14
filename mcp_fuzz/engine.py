@@ -60,7 +60,12 @@ from mcp_fuzz.generator import (
     missing_required_variants,
     wrong_type_variants,
 )
-from mcp_fuzz.sequence import extract_id, find_id_property, group_resource_tools
+from mcp_fuzz.sequence import (
+    extract_id,
+    find_id_property,
+    find_parent_child_pairs,
+    group_resource_tools,
+)
 
 DEFAULT_TIMEOUT_SECONDS = 15.0
 
@@ -111,7 +116,12 @@ class ToolResult:
 @dataclass
 class SequenceStep:
     tool: str
-    role: str  # "create" | "read" | "delete" | "read_after_delete"
+    # "create" | "read" | "delete" | "read_after_delete" for a single-resource
+    # chain; "create_parent" | "create_child" | "delete_parent" |
+    # "read_child_after_parent_delete" for a cross-resource one (see
+    # CrossResourceResult below) — the same step shape fits both, just with a
+    # different vocabulary of role names.
+    role: str
     outcome: CallOutcome
 
 
@@ -128,6 +138,25 @@ class SequenceResult:
 
 
 @dataclass
+class CrossResourceResult:
+    parent_resource: str
+    child_resource: str
+    parent_create_tool: str
+    child_create_tool: str
+    parent_delete_tool: str
+    child_read_tool: str
+    parent_link_property: str
+    steps: list[SequenceStep] = field(default_factory=list)
+    parent_id: str | None = None
+    child_id: str | None = None
+    # None if the chain didn't reach the final read (an earlier step
+    # failed) — distinct from False, which means it reached the read and
+    # the child correctly came back unreadable.
+    child_readable_after_parent_delete: bool | None = None
+    note: str = ""
+
+
+@dataclass
 class FuzzReport:
     server_command: str
     tools: list[ToolResult] = field(default_factory=list)
@@ -137,6 +166,12 @@ class FuzzReport:
     # resource group, chained with a real id from the real create response
     # rather than independent synthetic calls like everything else here.
     sequence_results: list[SequenceResult] = field(default_factory=list)
+    # Populated only when sequential=True in run_fuzz — see
+    # _run_cross_resource_checks. Each entry is one detected parent/child
+    # resource pair (e.g. a task referencing a project), chained across both
+    # resources' own create/delete/read tools rather than one resource's own
+    # trio like sequence_results above.
+    cross_resource_results: list[CrossResourceResult] = field(default_factory=list)
 
 
 class _ServerConnection:
@@ -414,6 +449,120 @@ async def _run_sequence_checks(
     return results
 
 
+async def _run_cross_resource_checks(
+    conn: _ServerConnection,
+    params: StdioServerParameters,
+    tools: list[types.Tool],
+    timeout: float,
+) -> list[CrossResourceResult]:
+    """For each detected parent/child resource pair (see
+    mcp_fuzz.sequence.find_parent_child_pairs) — e.g. a task created with a
+    real project's id — creates the parent, creates the child referencing
+    it, deletes the parent, then checks whether the child is still readable.
+    Unlike the single-resource stale-read finding above, that outcome isn't
+    scored as a pass or fail here: a still-readable child could mean a
+    missing cascade delete, or could just as easily be the server's
+    intended orphan-allowed design. It's reported as a named observation for
+    a human to judge, not a defect this check claims to have found."""
+    tools_by_name = {t.name: t for t in tools}
+    groups = group_resource_tools([t.name for t in tools])
+    create_schemas = {
+        g.create_tool: _field(tools_by_name[g.create_tool], "input_schema", "inputSchema")
+        for g in groups
+    }
+    pairs = find_parent_child_pairs(groups, create_schemas)
+    results: list[CrossResourceResult] = []
+
+    for pair in pairs:
+        parent, child = pair.parent, pair.child
+        result = CrossResourceResult(
+            parent_resource=parent.resource, child_resource=child.resource,
+            parent_create_tool=parent.create_tool, child_create_tool=child.create_tool,
+            parent_delete_tool=parent.delete_tool, child_read_tool=child.read_tool,
+            parent_link_property=pair.parent_link_property,
+        )
+
+        parent_args = generate_valid_arguments(create_schemas[parent.create_tool])
+        parent_create_outcome = await _call_with_outcome(
+            conn, params, parent.create_tool, "valid", None, parent_args, timeout,
+        )
+        result.steps.append(SequenceStep(tool=parent.create_tool, role="create_parent", outcome=parent_create_outcome))
+        if parent_create_outcome.outcome != "ok":
+            result.note = f"parent create call did not succeed ({parent_create_outcome.outcome}) — chain stops here"
+            results.append(result)
+            continue
+
+        parent_id = extract_id(parent_create_outcome.full_text, parent.resource)
+        if parent_id is None:
+            result.note = "parent create call succeeded but no id could be extracted from its response — chain stops here"
+            results.append(result)
+            continue
+        result.parent_id = parent_id
+
+        child_args = generate_valid_arguments(create_schemas[child.create_tool])
+        child_args[pair.parent_link_property] = parent_id
+        child_create_outcome = await _call_with_outcome(
+            conn, params, child.create_tool, "valid", None, child_args, timeout,
+        )
+        result.steps.append(SequenceStep(tool=child.create_tool, role="create_child", outcome=child_create_outcome))
+        if child_create_outcome.outcome != "ok":
+            result.note = f"child create call did not succeed ({child_create_outcome.outcome}) — chain stops here"
+            results.append(result)
+            continue
+
+        child_id = extract_id(child_create_outcome.full_text, child.resource)
+        if child_id is None:
+            result.note = "child create call succeeded but no id could be extracted from its response — chain stops here"
+            results.append(result)
+            continue
+        result.child_id = child_id
+
+        parent_delete_schema = _field(tools_by_name[parent.delete_tool], "input_schema", "inputSchema")
+        parent_delete_id_prop = find_id_property(parent_delete_schema, parent.resource)
+        if parent_delete_id_prop is None:
+            result.note = f"could not determine which parameter on {parent.delete_tool} identifies the parent — chain stops here"
+            results.append(result)
+            continue
+
+        parent_delete_args = generate_valid_arguments(parent_delete_schema)
+        parent_delete_args[parent_delete_id_prop] = parent_id
+        parent_delete_outcome = await _call_with_outcome(
+            conn, params, parent.delete_tool, "valid", None, parent_delete_args, timeout,
+        )
+        result.steps.append(SequenceStep(tool=parent.delete_tool, role="delete_parent", outcome=parent_delete_outcome))
+        if parent_delete_outcome.outcome != "ok":
+            result.note = f"parent delete call did not succeed ({parent_delete_outcome.outcome}) — chain stops here"
+            results.append(result)
+            continue
+
+        child_read_schema = _field(tools_by_name[child.read_tool], "input_schema", "inputSchema")
+        child_read_id_prop = find_id_property(child_read_schema, child.resource)
+        if child_read_id_prop is None:
+            result.note = f"could not determine which parameter on {child.read_tool} identifies the child — chain stops here"
+            results.append(result)
+            continue
+
+        child_read_args = generate_valid_arguments(child_read_schema)
+        child_read_args[child_read_id_prop] = child_id
+        child_read_outcome = await _call_with_outcome(
+            conn, params, child.read_tool, "valid", None, child_read_args, timeout,
+        )
+        result.steps.append(SequenceStep(
+            tool=child.read_tool, role="read_child_after_parent_delete", outcome=child_read_outcome,
+        ))
+        result.child_readable_after_parent_delete = child_read_outcome.outcome == "ok"
+        if result.child_readable_after_parent_delete:
+            result.note = (
+                f"{child.read_tool} still returns success reading a {child.resource} whose parent "
+                f"{parent.resource} was just deleted via {parent.delete_tool} — worth confirming this is "
+                "intentional (orphan-allowed) rather than a missing cascade delete"
+            )
+
+        results.append(result)
+
+    return results
+
+
 async def run_fuzz(
     command: str,
     args: list[str] | None = None,
@@ -495,6 +644,9 @@ async def run_fuzz(
         # destructive than testing a single write tool in isolation — never
         # run implicitly just because --sequential was passed.
         report.sequence_results = await _run_sequence_checks(
+            conn, params, tools_result.tools, timeout,
+        )
+        report.cross_resource_results = await _run_cross_resource_checks(
             conn, params, tools_result.tools, timeout,
         )
 

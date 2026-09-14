@@ -173,5 +173,93 @@ def delete_ticket(ticket_id: str) -> str:
     return f"deleted {ticket_id}"
 
 
+_PROJECTS: dict[str, dict] = {}
+_TASKS: dict[str, dict] = {}
+
+
+@server.tool(annotations=NOT_READ_ONLY)
+def create_project(name: str) -> str:
+    """Creates a project and returns its id as JSON — the parent half of a
+    deliberately buggy parent/child pair for the cross-resource lifecycle
+    check to exercise: delete_project below does not clean up the project's
+    own tasks."""
+    project_id = str(uuid.uuid4())
+    _PROJECTS[project_id] = {"id": project_id, "name": name}
+    return json.dumps(_PROJECTS[project_id])
+
+
+@server.tool(annotations=NOT_READ_ONLY)
+def delete_project(project_id: str) -> str:
+    """Deletes a project for real, but — deliberately, the bug this pair
+    exists to demonstrate — never touches any task that referenced it, so a
+    task created against this project stays fully readable afterward."""
+    _PROJECTS.pop(project_id, None)
+    return f"deleted {project_id}"
+
+
+@server.tool(annotations=NOT_READ_ONLY)
+def create_task(project_id: str, title: str) -> str:
+    """Creates a task referencing a real project id — the child half of the
+    project/task pair. Does not validate that project_id actually exists,
+    same as most real APIs' create endpoints for a dependent resource."""
+    task_id = str(uuid.uuid4())
+    _TASKS[task_id] = {"id": task_id, "project_id": project_id, "title": title}
+    return json.dumps(_TASKS[task_id])
+
+
+@server.tool(annotations=READ_ONLY)
+def get_task(task_id: str) -> str:
+    """Reads a task by id — stays readable even once its project is
+    deleted, since delete_project above never cascades. The cross-resource
+    check exists to surface exactly this as an observation, not silently
+    miss it the way testing project and task in isolation would."""
+    if task_id not in _TASKS:
+        raise ValueError(f"no task with id {task_id}")
+    return json.dumps(_TASKS[task_id])
+
+
+_TEAMS: dict[str, dict] = {}
+_MEMBERS: dict[str, dict] = {}
+
+
+@server.tool(annotations=NOT_READ_ONLY)
+def create_team(name: str) -> str:
+    """Creates a team and returns its id as JSON — the parent half of a
+    correctly-behaved parent/child pair, included as a clean contrast to
+    the buggy project/task pair above: delete_team below does cascade."""
+    team_id = str(uuid.uuid4())
+    _TEAMS[team_id] = {"id": team_id, "name": name}
+    return json.dumps(_TEAMS[team_id])
+
+
+@server.tool(annotations=NOT_READ_ONLY)
+def delete_team(team_id: str) -> str:
+    """Deletes a team for real, and — the correctly-behaved case — also
+    removes every member that referenced it, so a member created against
+    this team correctly stops being readable afterward."""
+    _TEAMS.pop(team_id, None)
+    for member_id in [m_id for m_id, m in _MEMBERS.items() if m["team_id"] == team_id]:
+        _MEMBERS.pop(member_id, None)
+    return f"deleted {team_id}"
+
+
+@server.tool(annotations=NOT_READ_ONLY)
+def create_member(team_id: str, name: str) -> str:
+    """Creates a member referencing a real team id — the child half of the
+    team/member pair."""
+    member_id = str(uuid.uuid4())
+    _MEMBERS[member_id] = {"id": member_id, "team_id": team_id, "name": name}
+    return json.dumps(_MEMBERS[member_id])
+
+
+@server.tool(annotations=READ_ONLY)
+def get_member(member_id: str) -> str:
+    """Reads a member by id — correctly errors once its team (and thus this
+    member, via delete_team's cascade) has been deleted."""
+    if member_id not in _MEMBERS:
+        raise ValueError(f"no member with id {member_id}")
+    return json.dumps(_MEMBERS[member_id])
+
+
 if __name__ == "__main__":
     server.run(transport="stdio")

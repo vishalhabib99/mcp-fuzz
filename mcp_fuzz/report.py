@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from mcp_fuzz.engine import CallOutcome, FuzzReport, SequenceResult, ToolResult
+from mcp_fuzz.engine import CallOutcome, CrossResourceResult, FuzzReport, SequenceResult, ToolResult
 
 BAD_INPUT_CASES = {"missing_required", "wrong_type"}
 
@@ -135,6 +135,19 @@ class SequenceSummary:
 
 
 @dataclass
+class CrossResourceSummary:
+    # Also unscored, and for a stronger reason than SequenceSummary above:
+    # a child resource remaining readable after its parent is deleted isn't
+    # unambiguously wrong the way a stale-after-delete read is — it can be
+    # a deliberate orphan-allowed design. So this isn't even binary
+    # pass/fail, just a count of pairs found and how many produced a
+    # still-readable-child observation worth a human looking at.
+    pairs_detected: int
+    orphaned_child_count: int
+    results: list[CrossResourceResult]
+
+
+@dataclass
 class Report:
     server_command: str
     connect_error: str | None
@@ -150,6 +163,7 @@ class Report:
     response_size: ResponseSizeSummary
     concurrency: ConcurrencySummary
     sequence: SequenceSummary
+    cross_resource: CrossResourceSummary
 
 
 def _grade_for_percent(pct: float) -> str:
@@ -228,12 +242,18 @@ def build_report(
         response_size=_compute_response_size(tool_reports, bloat_threshold_chars),
         concurrency=_compute_concurrency(tool_reports),
         sequence=_compute_sequence(raw.sequence_results),
+        cross_resource=_compute_cross_resource(raw.cross_resource_results),
     )
 
 
 def _compute_sequence(groups: list[SequenceResult]) -> SequenceSummary:
     stale_count = sum(1 for g in groups if g.stale_after_delete)
     return SequenceSummary(groups_detected=len(groups), stale_after_delete_count=stale_count, groups=groups)
+
+
+def _compute_cross_resource(results: list[CrossResourceResult]) -> CrossResourceSummary:
+    orphaned = sum(1 for r in results if r.child_readable_after_parent_delete)
+    return CrossResourceSummary(pairs_detected=len(results), orphaned_child_count=orphaned, results=results)
 
 
 def _median(values: list[float]) -> float:
@@ -404,6 +424,13 @@ def render_text(report: Report) -> str:
             f"Resource lifecycle: {seq.groups_detected} create/read/delete group(s) detected, "
             f"{seq.stale_after_delete_count} stale-after-delete finding(s)"
         )
+
+    cr = report.cross_resource
+    if cr.pairs_detected > 0:
+        lines.append(
+            f"Cross-resource lifecycle: {cr.pairs_detected} parent/child pair(s) detected, "
+            f"{cr.orphaned_child_count} still-readable-after-parent-delete observation(s) — not scored, see below"
+        )
     lines.append("")
 
     slow_by_name = {f.name: f for f in report.latency.slow_tools}
@@ -456,6 +483,21 @@ def render_text(report: Report) -> str:
             lines.append(f"  [{marker}] {g.resource}: {chain}")
             if g.note:
                 lines.append(f"      {g.note}")
+
+    if cr.pairs_detected > 0:
+        lines.append("")
+        lines.append("Cross-resource lifecycle (child created against a real parent id, parent then deleted):")
+        for r in cr.results:
+            if r.child_readable_after_parent_delete is None:
+                marker = "skip"
+            elif r.child_readable_after_parent_delete:
+                marker = "observation"
+            else:
+                marker = "ok"
+            chain = " -> ".join(s.tool for s in r.steps)
+            lines.append(f"  [{marker}] {r.child_resource} (parent: {r.parent_resource}): {chain}")
+            if r.note:
+                lines.append(f"      {r.note}")
 
     return "\n".join(lines)
 
@@ -522,6 +564,30 @@ def to_dict(report: Report) -> dict:
                     ],
                 }
                 for g in report.sequence.groups
+            ],
+        },
+        "cross_resource": {
+            "pairs_detected": report.cross_resource.pairs_detected,
+            "orphaned_child_count": report.cross_resource.orphaned_child_count,
+            "results": [
+                {
+                    "parent_resource": r.parent_resource,
+                    "child_resource": r.child_resource,
+                    "parent_create_tool": r.parent_create_tool,
+                    "child_create_tool": r.child_create_tool,
+                    "parent_delete_tool": r.parent_delete_tool,
+                    "child_read_tool": r.child_read_tool,
+                    "parent_link_property": r.parent_link_property,
+                    "parent_id": r.parent_id,
+                    "child_id": r.child_id,
+                    "child_readable_after_parent_delete": r.child_readable_after_parent_delete,
+                    "note": r.note,
+                    "steps": [
+                        {"tool": s.tool, "role": s.role, "outcome": _outcome_dict(s.outcome)}
+                        for s in r.steps
+                    ],
+                }
+                for r in report.cross_resource.results
             ],
         },
         "tools": [
