@@ -56,6 +56,8 @@ mcp-fuzz --json -- python server.py
 mcp-fuzz --fail-under 90 -- python server.py   # non-zero exit if crash resilience < 90%
 ```
 
+Want this alongside mcp-doctor's static checks and mcp-reality-check's output-fidelity checks in one PR comment instead of three? [`mcp-trust-check`](https://github.com/vishalhabib99/mcp-trust-check) is a single GitHub Action that runs all three and posts one combined score.
+
 ## Latency check
 
 Every call was always timed internally (see Full-fidelity trace export below) — this surfaces that timing as a real, scored part of the report instead of leaving it buried in an opt-in export. For each tested tool's **valid** call (the one call that does real work, unlike a bad-input call that's typically rejected before any real work happens), mcp-fuzz flags a tool as slow when either is true:
