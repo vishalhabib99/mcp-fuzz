@@ -90,6 +90,26 @@ mcp-fuzz --fail-under-response-size 90 -- python server.py
 
 **Same caveat as latency**: one real call per tool, not representative of every possible input a tool could return. A tool genuinely designed to return a lot of content (a full-file read, a config dump) isn't a bug just because it's large relative to its neighbors — this is a "worth a look" signal, not a confirmed problem.
 
+## Runtime gate — the same two checks, live during a real agent session
+
+Everything above runs once, offline: one synthetic-but-realistic call per tool, scored in a batch report. `LatencyGate` applies the identical two-signal design (absolute threshold + relative outlier) to real calls an agent makes during a live session — with one real design difference, not just a mechanical port: a one-shot audit only ever has one call per tool to compare against its *siblings* on the same server, but a live session can call the same tool many times, so `LatencyGate` tracks each tool's own call history and flags a call that's unusual **for that tool**, not relative to unrelated tools it happens to share a server with.
+
+```python
+from mcp_fuzz.gate import LatencyGate
+
+gate = LatencyGate()  # one instance per session — history accumulates across calls
+
+# in place of a bare `await session.call_tool(tool_name, arguments)`:
+result = await gate.timed_call(session, tool_name, arguments)
+
+if result.outcome != "ok":
+    ...  # crashed or timed out
+elif result.flagged:
+    ...  # unusually slow or large for this tool, given what it's done before
+```
+
+Verified against a real crash and a real timeout (the fixture server's `kills_process`/`hangs_forever` tools, not mocked), and dogfooded live against the official `@modelcontextprotocol/server-memory` reference server — real `create_entities`/`read_graph` calls, both correctly unflagged. Same companion as [`mcp_reality_check.gate`](https://github.com/vishalhabib99/mcp-reality-check#runtime-gate--use-it-live-not-just-as-a-batch-audit): correctness there, latency/size here — compose both in the same call site if you want both.
+
 ## Concurrency check — opt-in
 
 Everything above calls one tool at a time. This is the one check that doesn't: with `--concurrency N`, for each tested tool, mcp-fuzz also launches `N` **independent connections** — each its own subprocess of the target server command — and calls the tool with the same valid arguments on all of them at once. Independent connections, not N calls fanned out over one shared session, deliberately: it's a real test of concurrent access to whatever backend the server itself talks to (a shared file, database, lock, rate limiter), the kind of bug that N sequential calls on one connection structurally can't surface.
