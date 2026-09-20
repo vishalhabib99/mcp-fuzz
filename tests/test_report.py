@@ -16,12 +16,14 @@ import pytest
 
 from mcp_fuzz.engine import CallOutcome, run_fuzz
 from mcp_fuzz.report import (
+    CHARS_PER_TOKEN_ESTIMATE,
     LATENCY_ABSOLUTE_SLOW_MS,
     RESPONSE_SIZE_ABSOLUTE_CHARS,
     ToolReport,
     _compute_concurrency,
     _compute_latency,
     _compute_response_size,
+    _compute_token_cost,
     build_report,
 )
 
@@ -145,6 +147,34 @@ def test_custom_bloat_threshold_overrides_default():
     assert _compute_response_size(tools, 500).bloated_tools != []
 
 
+def test_token_cost_sums_across_tools_using_char_estimate():
+    tools = [_sized_tool("a", 400), _sized_tool("b", 800)]
+    summary = _compute_token_cost(tools)
+    assert summary.checked_count == 2
+    assert summary.total_tokens_estimated == (400 + 800) // CHARS_PER_TOKEN_ESTIMATE
+    assert summary.avg_tokens_per_call == summary.total_tokens_estimated / 2
+
+
+def test_token_cost_none_when_no_sized_tools():
+    tools = [_sized_tool("crashed", 200)]
+    tools[0].valid_call_response_chars = None
+    summary = _compute_token_cost(tools)
+    assert summary.checked_count == 0
+    assert summary.total_tokens_estimated is None
+    assert summary.avg_tokens_per_call is None
+
+
+def test_token_cost_excludes_crashed_or_timed_out_calls_from_total():
+    # Same exclusion as response_size: a crashed/timed-out valid call has no
+    # real response to count the size of, so it shouldn't silently pull the
+    # session total down (or up) as if it cost zero tokens.
+    tools = [_sized_tool("ok", 400), _sized_tool("crashed", 200)]
+    tools[1].valid_call_response_chars = None
+    summary = _compute_token_cost(tools)
+    assert summary.checked_count == 1
+    assert summary.total_tokens_estimated == 400 // CHARS_PER_TOKEN_ESTIMATE
+
+
 @pytest.fixture(scope="module")
 def fixture_report():
     import asyncio
@@ -173,6 +203,18 @@ def test_fixture_bloated_tool_is_flagged_end_to_end(fixture_report):
     bloated_names = {f.name for f in report.response_size.bloated_tools}
     assert "bloated_but_fine" in bloated_names
     assert "well_behaved" not in bloated_names
+
+
+def test_fixture_token_cost_reflects_real_response_sizes_end_to_end(fixture_report):
+    # Proves the total is built from the engine's real response_chars, not
+    # a fixed/synthetic value — bloated_but_fine's real 10000x-repeated
+    # response should dominate the fixture's total token estimate.
+    report = build_report(fixture_report)
+    tc = report.token_cost
+    assert tc.checked_count > 0
+    assert tc.total_tokens_estimated is not None
+    bloated = next(t for t in report.tools if t.name == "bloated_but_fine")
+    assert tc.total_tokens_estimated > (bloated.valid_call_response_chars // CHARS_PER_TOKEN_ESTIMATE) * 0.5
 
 
 def test_concurrency_not_computed_when_no_tool_was_concurrency_tested():

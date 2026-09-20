@@ -8,7 +8,7 @@ Runtime behavioral testing for [MCP](https://modelcontextprotocol.io) servers.
 
 [`mcp-doctor`](https://github.com/vishalhabib99/mcp-doctor) reads an MCP server's *source code* and checks whether its tools are well-documented. `mcp-fuzz` does the opposite: it actually **launches the server and calls its tools**, with inputs derived from each tool's own declared JSON schema, and checks whether the server behaves the way that schema and its description claim — does a missing required field get a structured error back, or does the server crash? Does a wrong-typed field get rejected cleanly, or does it hang?
 
-Static analysis can't see any of that. Only running the code can. It also measures things static analysis structurally can't: how long each tool actually takes to respond ([Latency check](#latency-check)), how large its response actually is ([Response size check](#response-size-check)), whether it behaves correctly when several callers hit it at once ([Concurrency check](#concurrency-check--opt-in)), whether a resource actually stays deleted once a tool says it deleted it ([Resource lifecycle check](#resource-lifecycle-check--opt-in-chains-a-real-id)), and whether deleting one resource leaves another that referenced it orphaned ([Cross-resource lifecycle check](#cross-resource-lifecycle-check--opt-in-parentchild-workflows)) — all opt-in.
+Static analysis can't see any of that. Only running the code can. It also measures things static analysis structurally can't: how long each tool actually takes to respond ([Latency check](#latency-check)), how large its response actually is ([Response size check](#response-size-check)) and what that adds up to across a whole session ([Token cost estimate](#token-cost-estimate)), whether it behaves correctly when several callers hit it at once ([Concurrency check](#concurrency-check--opt-in)), whether a resource actually stays deleted once a tool says it deleted it ([Resource lifecycle check](#resource-lifecycle-check--opt-in-chains-a-real-id)), and whether deleting one resource leaves another that referenced it orphaned ([Cross-resource lifecycle check](#cross-resource-lifecycle-check--opt-in-parentchild-workflows)) — all opt-in except latency, response size, and token cost, which need no flag.
 
 It still deliberately stops short of judging whether a *successful* call's response is actually correct — a schema-only placeholder value usually isn't realistic enough to fairly judge that. [`mcp-reality-check`](https://github.com/vishalhabib99/mcp-reality-check) is the third tool in the family that picks up exactly that: does it fail safely, and does it actually work.
 
@@ -89,6 +89,16 @@ mcp-fuzz --fail-under-response-size 90 -- python server.py
 ```
 
 **Same caveat as latency**: one real call per tool, not representative of every possible input a tool could return. A tool genuinely designed to return a lot of content (a full-file read, a config dump) isn't a bug just because it's large relative to its neighbors — this is a "worth a look" signal, not a confirmed problem.
+
+## Token cost estimate
+
+The response size check above flags individual outliers; this rolls the same ~4-chars/token estimate up into one whole-session number — a rough answer to "what would it cost an agent's context window to call every tested tool here once." Always computed, no flag needed: it's a pure rollup of data the response size check already gathers, not a new call against the server.
+
+```
+Estimated token cost: ~5,412 tokens total across 12 tool(s) (~451 avg/call) — one call per tool, ~4 chars/token rule of thumb, not a real tokenizer or dollar figure
+```
+
+Deliberately **tokens only, never dollars**: a real dollar figure depends on which model is actually consuming the response and that model's current per-token pricing — neither of which this tool has any way to know without guessing, and a guessed number presented as a cost is worse than no number at all. Same crash/timeout exclusion as latency and response size: a call with no real response has nothing to count.
 
 ## Runtime gate — the same two checks, live during a real agent session
 

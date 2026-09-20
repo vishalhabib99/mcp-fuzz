@@ -44,6 +44,17 @@ RESPONSE_SIZE_ABSOLUTE_CHARS = 20000
 RESPONSE_SIZE_OUTLIER_MULTIPLIER = 3.0
 MIN_TOOLS_FOR_RESPONSE_SIZE_OUTLIER = 3
 
+# Same rough ~4-chars/token rule of thumb response_size already surfaces
+# per-tool, used here to roll every tested tool's single valid call up into
+# one whole-session total — a rough answer to "what would it cost an
+# agent's context window to call every tool here once." Deliberately
+# tokens only, never dollars: a real $ figure depends on which model is
+# actually consuming the response and that model's current per-token
+# pricing, neither of which this tool has any way to know without guessing
+# — and guessing at a number presented as a cost is worse than not
+# reporting one at all.
+CHARS_PER_TOKEN_ESTIMATE = 4
+
 
 @dataclass
 class ToolReport:
@@ -104,6 +115,19 @@ class ResponseSizeSummary:
 
 
 @dataclass
+class TokenCostSummary:
+    # Not scored with a percent/grade like latency/response-size — there's
+    # no pass/fail threshold for "how much would this cost", just a number
+    # worth knowing. checked_count mirrors response_size's: tools whose
+    # valid call crashed/timed out (no real response to size) are excluded,
+    # same reasoning as everywhere else a crashed call has nothing to time
+    # or size.
+    checked_count: int
+    total_tokens_estimated: int | None
+    avg_tokens_per_call: float | None
+
+
+@dataclass
 class ConcurrencyFlag:
     name: str
     crashes: int
@@ -161,6 +185,7 @@ class Report:
     grade: str | None
     latency: LatencySummary
     response_size: ResponseSizeSummary
+    token_cost: TokenCostSummary
     concurrency: ConcurrencySummary
     sequence: SequenceSummary
     cross_resource: CrossResourceSummary
@@ -240,6 +265,7 @@ def build_report(
         grade=grade,
         latency=_compute_latency(tool_reports, slow_threshold_ms),
         response_size=_compute_response_size(tool_reports, bloat_threshold_chars),
+        token_cost=_compute_token_cost(tool_reports),
         concurrency=_compute_concurrency(tool_reports),
         sequence=_compute_sequence(raw.sequence_results),
         cross_resource=_compute_cross_resource(raw.cross_resource_results),
@@ -299,7 +325,10 @@ def _compute_response_size(tool_reports: list[ToolReport], bloat_threshold_chars
     for name, chars in sized:
         reasons = []
         if chars > bloat_threshold_chars:
-            reasons.append(f"{chars:,} chars (~{chars // 4:,} est. tokens), over the {bloat_threshold_chars:,}-char absolute threshold")
+            reasons.append(
+                f"{chars:,} chars (~{chars // CHARS_PER_TOKEN_ESTIMATE:,} est. tokens), "
+                f"over the {bloat_threshold_chars:,}-char absolute threshold"
+            )
         if enough_for_relative and chars > RESPONSE_SIZE_OUTLIER_MULTIPLIER * median:
             reasons.append(f"{chars / median:.1f}x this server's median ({median:.0f} chars)")
         if reasons:
@@ -309,6 +338,20 @@ def _compute_response_size(tool_reports: list[ToolReport], bloat_threshold_chars
     grade = _grade_for_percent(percent)
     return ResponseSizeSummary(
         checked_count=len(sized), median_chars=median, bloated_tools=bloated_tools, percent=percent, grade=grade,
+    )
+
+
+def _compute_token_cost(tool_reports: list[ToolReport]) -> TokenCostSummary:
+    sized = [t.valid_call_response_chars for t in tool_reports if t.valid_call_response_chars is not None]
+    if not sized:
+        return TokenCostSummary(checked_count=0, total_tokens_estimated=None, avg_tokens_per_call=None)
+
+    total_chars = sum(sized)
+    total_tokens = total_chars // CHARS_PER_TOKEN_ESTIMATE
+    return TokenCostSummary(
+        checked_count=len(sized),
+        total_tokens_estimated=total_tokens,
+        avg_tokens_per_call=total_tokens / len(sized),
     )
 
 
@@ -409,6 +452,14 @@ def render_text(report: Report) -> str:
         )
     else:
         lines.append("Response size: n/a (no tool completed a sized valid call)")
+
+    tc = report.token_cost
+    if tc.total_tokens_estimated is not None:
+        lines.append(
+            f"Estimated token cost: ~{tc.total_tokens_estimated:,} tokens total across {tc.checked_count} tool(s) "
+            f"(~{tc.avg_tokens_per_call:,.0f} avg/call) — one call per tool, ~4 chars/token rule of thumb, "
+            "not a real tokenizer or dollar figure — see README"
+        )
 
     conc = report.concurrency
     if conc.percent is not None:
@@ -535,6 +586,11 @@ def to_dict(report: Report) -> dict:
                 {"name": f.name, "response_chars": f.response_chars, "reasons": f.reasons}
                 for f in report.response_size.bloated_tools
             ],
+        },
+        "token_cost": {
+            "checked_count": report.token_cost.checked_count,
+            "total_tokens_estimated": report.token_cost.total_tokens_estimated,
+            "avg_tokens_per_call": report.token_cost.avg_tokens_per_call,
         },
         "concurrency": {
             "concurrency": report.concurrency.concurrency,
