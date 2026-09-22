@@ -30,7 +30,20 @@ def main() -> None:
         "command",
         nargs=argparse.REMAINDER,
         help="the command (and its arguments) that launches the target MCP server, "
-        "e.g. `mcp-fuzz -- python server.py` or `mcp-fuzz -- npx -y some-mcp-server`",
+        "e.g. `mcp-fuzz -- python server.py` or `mcp-fuzz -- npx -y some-mcp-server`. "
+        "Mutually exclusive with --url — use one or the other.",
+    )
+    parser.add_argument(
+        "--url", default=None,
+        help="connect to a remote MCP server over Streamable HTTP at this URL instead of "
+        "launching a local stdio command, e.g. `mcp-fuzz --url https://example.com/mcp`. "
+        "Mutually exclusive with the `-- <command>` form.",
+    )
+    parser.add_argument(
+        "--header", action="append", default=[], metavar="KEY=VALUE",
+        help="pass an HTTP header on every request to --url (repeatable), e.g. "
+        "--header 'Authorization=Bearer ...' — the --url equivalent of --env for a stdio "
+        "command. Only valid with --url.",
     )
     parser.add_argument(
         "--include-destructive",
@@ -110,28 +123,50 @@ def main() -> None:
     args = parser.parse_args()
 
     command_parts = [c for c in args.command if c != "--"]
-    if not command_parts:
-        parser.error("no server command given — e.g. `mcp-fuzz -- python server.py`")
+    if args.url and command_parts:
+        parser.error("--url and a launch command are mutually exclusive — use one or the other")
+    if not args.url and not command_parts:
+        parser.error("no server command given — e.g. `mcp-fuzz -- python server.py`, or use --url for a remote server")
+    if args.header and not args.url:
+        parser.error("--header requires --url")
+    if args.env and args.url:
+        parser.error("--env requires a launch command, not --url — use --header for a remote server's auth")
     if args.sequential and not args.include_destructive:
         parser.error("--sequential requires --include-destructive (it creates and deletes real data)")
 
-    env = {}
-    for pair in args.env:
-        key, sep, value = pair.partition("=")
-        if not sep:
-            parser.error(f"--env expects KEY=VALUE, got {pair!r}")
-        env[key] = value
+    if args.url:
+        headers = {}
+        for pair in args.header:
+            key, sep, value = pair.partition("=")
+            if not sep:
+                parser.error(f"--header expects KEY=VALUE, got {pair!r}")
+            headers[key] = value
+        raw = asyncio.run(run_fuzz(
+            url=args.url,
+            headers=headers or None,
+            include_destructive=args.include_destructive,
+            timeout=args.timeout,
+            concurrency=args.concurrency,
+            sequential=args.sequential,
+        ))
+    else:
+        env = {}
+        for pair in args.env:
+            key, sep, value = pair.partition("=")
+            if not sep:
+                parser.error(f"--env expects KEY=VALUE, got {pair!r}")
+            env[key] = value
 
-    command, *rest = command_parts
-    raw = asyncio.run(run_fuzz(
-        command=command,
-        args=rest,
-        env=env or None,
-        include_destructive=args.include_destructive,
-        timeout=args.timeout,
-        concurrency=args.concurrency,
-        sequential=args.sequential,
-    ))
+        command, *rest = command_parts
+        raw = asyncio.run(run_fuzz(
+            command=command,
+            args=rest,
+            env=env or None,
+            include_destructive=args.include_destructive,
+            timeout=args.timeout,
+            concurrency=args.concurrency,
+            sequential=args.sequential,
+        ))
     report = build_report(
         raw, slow_threshold_ms=args.slow_threshold_ms, bloat_threshold_chars=args.bloat_threshold_chars,
         price_model=args.price_model,

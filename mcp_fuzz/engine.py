@@ -1,6 +1,7 @@
-"""Connects to a real, running MCP server over stdio and calls each of its
-tools with schema-derived inputs to see how it actually behaves — distinct
-from static analysis (mcp-doctor), which never runs the code at all.
+"""Connects to a real, running MCP server — over stdio (a launched local
+command) or Streamable HTTP (a remote URL) — and calls each of its tools with
+schema-derived inputs to see how it actually behaves — distinct from static
+analysis (mcp-doctor), which never runs the code at all.
 
 Safety: a tool that isn't explicitly annotated `readOnlyHint: true` is
 skipped by default. This library has no way to know whether a "write"-shaped
@@ -26,6 +27,7 @@ from dataclasses import dataclass, field
 
 from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import get_default_environment, stdio_client
+from mcp.client.streamable_http import create_mcp_http_client, streamable_http_client
 
 try:
     # mcp>=2.0 names this MCPError (all-caps); mcp==1.0.0's wheel only has
@@ -161,6 +163,12 @@ class FuzzReport:
     server_command: str
     tools: list[ToolResult] = field(default_factory=list)
     connect_error: str | None = None
+    # Set when a tool crashed the server badly enough that the follow-up
+    # reconnect itself failed (see _try_reconnect) — distinct from
+    # connect_error, which means the *initial* connection never succeeded at
+    # all. Any tool after the one that triggered this is reported as
+    # untested with a skip_reason, not silently dropped or endlessly retried.
+    terminated_early: str | None = None
     # Populated only when sequential=True in run_fuzz — see
     # _run_sequence_checks. Each entry is one detected create/read/delete
     # resource group, chained with a real id from the real create response
@@ -174,20 +182,53 @@ class FuzzReport:
     cross_resource_results: list[CrossResourceResult] = field(default_factory=list)
 
 
-class _ServerConnection:
-    """One live stdio connection to the target server, reconnectable on
-    demand after a crash/timeout without tearing down the whole fuzz run."""
+@dataclass
+class HttpTarget:
+    """A remote MCP server reached over Streamable HTTP instead of a local
+    launchable stdio command — the other transport the spec allows, and
+    increasingly how a hosted/SaaS MCP server actually ships (a real target
+    dogfooded while building this, pipedrive-mcp-server, supports both and
+    can only be reached this way when deployed remotely, not locally
+    launched). `headers` carries auth (a bearer token, an API key header)
+    the same way `--env` carries one into a launched stdio process."""
 
-    def __init__(self, params: StdioServerParameters):
-        self._params = params
+    url: str
+    headers: dict[str, str] | None = None
+
+
+# Either transport the spec allows: a local command mcp-fuzz launches and
+# owns the lifecycle of, or a remote endpoint it only ever connects to.
+ConnectionTarget = StdioServerParameters | HttpTarget
+
+
+class _ServerConnection:
+    """One live connection to the target server (stdio or HTTP), reconnectable
+    on demand after a crash/timeout without tearing down the whole fuzz run."""
+
+    def __init__(self, target: ConnectionTarget):
+        self._target = target
         self._stack: AsyncExitStack | None = None
         self.session: ClientSession | None = None
+        # Set once a reconnect-after-crash attempt itself fails — meaning
+        # the server is now genuinely gone, not just the one call that
+        # triggered the reconnect. For a stdio target this is rare (mcp-fuzz
+        # owns the subprocess and can almost always relaunch it); for an
+        # HttpTarget it's expected the moment a tool kills the remote
+        # process, since mcp-fuzz has no way to relaunch a service it
+        # doesn't own. See _try_reconnect below.
+        self.unreachable = False
 
     async def connect(self) -> None:
         await self.close()
         stack = AsyncExitStack()
         try:
-            read, write = await stack.enter_async_context(stdio_client(self._params))
+            if isinstance(self._target, HttpTarget):
+                http_client = create_mcp_http_client(headers=self._target.headers)
+                read, write = await stack.enter_async_context(
+                    streamable_http_client(self._target.url, http_client=http_client)
+                )
+            else:
+                read, write = await stack.enter_async_context(stdio_client(self._target))
             session = await stack.enter_async_context(ClientSession(read, write))
             await session.initialize()
         except BaseException:
@@ -195,6 +236,7 @@ class _ServerConnection:
             raise
         self._stack = stack
         self.session = session
+        self.unreachable = False
 
     async def close(self) -> None:
         if self._stack is not None:
@@ -226,6 +268,25 @@ def _field(model, snake_name: str, camel_name: str):
     return getattr(model, camel_name)
 
 
+async def _try_reconnect(conn: _ServerConnection) -> None:
+    """Reconnect after a crash/timeout, the way `_call_with_outcome` below
+    always has — except now tolerant of the reconnect itself failing.
+    Previously an unrecoverable reconnect propagated the raw exception all
+    the way out of `run_fuzz`, crashing the entire tool-testing run instead
+    of reporting the failure — a defect that happened to almost never
+    manifest against a stdio target (mcp-fuzz owns the subprocess, so
+    relaunching it after a crash virtually always works) but is the expected
+    outcome the moment a tool kills the process behind an HttpTarget: mcp-fuzz
+    doesn't own a remote server and has no way to relaunch it. Marks
+    `conn.unreachable` instead of raising; `run_fuzz`'s loop checks that flag
+    to stop attempting further calls and report the remaining tools as
+    skipped, rather than repeating the same doomed call once per tool."""
+    try:
+        await conn.connect()
+    except Exception:
+        conn.unreachable = True
+
+
 def _is_read_only(tool: types.Tool) -> bool:
     annotations = tool.annotations
     if annotations is None:
@@ -235,7 +296,7 @@ def _is_read_only(tool: types.Tool) -> bool:
 
 async def _call_with_outcome(
     conn: _ServerConnection,
-    params: StdioServerParameters,
+    params: ConnectionTarget,
     tool_name: str,
     case: str,
     property_name: str | None,
@@ -257,7 +318,7 @@ async def _call_with_outcome(
         # below, misclassifying a genuine timeout as a crash. Caught this
         # via CI running 3.10 (mcp itself requires >=3.10), not locally,
         # where dev happened to be on 3.11+.
-        await conn.connect()
+        await _try_reconnect(conn)
         return CallOutcome(case, property_name, "timeout", f"no response within {timeout}s")
     except MCPError as exc:
         if exc.code == _REQUEST_TIMEOUT:
@@ -266,7 +327,7 @@ async def _call_with_outcome(
             # despite arriving as an MCPError this is a timeout, not a
             # server response. Reconnect: a timed-out in-flight request can
             # still be pending server-side over the shared connection.
-            await conn.connect()
+            await _try_reconnect(conn)
             return CallOutcome(case, property_name, "timeout", f"no response within {timeout}s ({exc.message})")
         if exc.code == _INVALID_PARAMS:
             # The *only* MCPError code that means "the server actually
@@ -294,10 +355,10 @@ async def _call_with_outcome(
         # which silently turned those 133 genuine internal crashes into a
         # false 100%/A. Only INVALID_PARAMS is safe to trust as "properly
         # handled" — anything else is conservatively still a crash.
-        await conn.connect()
+        await _try_reconnect(conn)
         return CallOutcome(case, property_name, "crash", f"{type(exc).__name__} (code {exc.code}): {exc.message}")
     except Exception as exc:
-        await conn.connect()
+        await _try_reconnect(conn)
         return CallOutcome(case, property_name, "crash", f"{type(exc).__name__}: {exc}")
 
     if isinstance(result, types.CallToolResult) and _field(result, "is_error", "isError"):
@@ -336,10 +397,11 @@ def _merged_env(env: dict[str, str] | None) -> dict[str, str] | None:
 
 
 async def _run_concurrent_valid_calls(
-    params: StdioServerParameters, tool_name: str, valid_args: dict, timeout: float, concurrency: int,
+    params: ConnectionTarget, tool_name: str, valid_args: dict, timeout: float, concurrency: int,
 ) -> list[CallOutcome]:
     """Launches `concurrency` independent connections (each its own
-    subprocess of the target server command) and calls the same tool with
+    subprocess of the target server command, or its own HTTP session against
+    the same URL for an HttpTarget) and calls the same tool with
     the same valid arguments on all of them at once via asyncio.gather —
     a real test of concurrent access to whatever shared backend the server
     itself talks to (a shared file, database, lock), which N sequential
@@ -364,7 +426,7 @@ async def _run_concurrent_valid_calls(
 
 async def _run_sequence_checks(
     conn: _ServerConnection,
-    params: StdioServerParameters,
+    params: ConnectionTarget,
     tools: list[types.Tool],
     timeout: float,
 ) -> list[SequenceResult]:
@@ -451,7 +513,7 @@ async def _run_sequence_checks(
 
 async def _run_cross_resource_checks(
     conn: _ServerConnection,
-    params: StdioServerParameters,
+    params: ConnectionTarget,
     tools: list[types.Tool],
     timeout: float,
 ) -> list[CrossResourceResult]:
@@ -564,18 +626,31 @@ async def _run_cross_resource_checks(
 
 
 async def run_fuzz(
-    command: str,
+    command: str | None = None,
     args: list[str] | None = None,
     env: dict[str, str] | None = None,
     cwd: str | None = None,
+    url: str | None = None,
+    headers: dict[str, str] | None = None,
     include_destructive: bool = False,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
     concurrency: int = 0,
     sequential: bool = False,
 ) -> FuzzReport:
-    merged_env = _merged_env(env)
-    params = StdioServerParameters(command=command, args=args or [], env=merged_env, cwd=cwd)
-    server_label = " ".join([command, *(args or [])])
+    # Exactly one transport: a local command to launch, or a remote URL to
+    # connect to — never both (which one wins would be an arbitrary,
+    # silently-surprising choice) and never neither (nothing to test).
+    if (command is None) == (url is None):
+        raise ValueError("exactly one of `command` or `url` must be given")
+
+    params: ConnectionTarget
+    if url is not None:
+        params = HttpTarget(url=url, headers=headers)
+        server_label = url
+    else:
+        merged_env = _merged_env(env)
+        params = StdioServerParameters(command=command, args=args or [], env=merged_env, cwd=cwd)
+        server_label = " ".join([command, *(args or [])])
     report = FuzzReport(server_command=server_label)
 
     conn = _ServerConnection(params)
@@ -594,6 +669,14 @@ async def run_fuzz(
         return report
 
     for tool in tools_result.tools:
+        if conn.unreachable:
+            report.tools.append(ToolResult(
+                name=tool.name,
+                tested=False,
+                skip_reason=f"server became unreachable mid-run ({report.terminated_early})",
+            ))
+            continue
+
         if not include_destructive and not _is_read_only(tool):
             report.tools.append(ToolResult(
                 name=tool.name,
@@ -626,10 +709,25 @@ async def run_fuzz(
         result.outcomes.append(await _timed_call("valid", None, valid_args))
 
         for prop_name, args in missing_required_variants(schema):
+            if conn.unreachable:
+                break
             result.outcomes.append(await _timed_call("missing_required", prop_name, args))
 
         for prop_name, args in wrong_type_variants(schema):
+            if conn.unreachable:
+                break
             result.outcomes.append(await _timed_call("wrong_type", prop_name, args))
+
+        if conn.unreachable and report.terminated_early is None:
+            last = result.outcomes[-1] if result.outcomes else None
+            report.terminated_early = (
+                f"tool {tool.name!r} crashed the server and the reconnect itself failed"
+                + (f": {last.detail}" if last else "")
+            )
+
+        if conn.unreachable:
+            report.tools.append(result)
+            continue
 
         if concurrency > 0:
             result.concurrent_outcomes = await _run_concurrent_valid_calls(
@@ -638,11 +736,13 @@ async def run_fuzz(
 
         report.tools.append(result)
 
-    if sequential and include_destructive:
+    if sequential and include_destructive and not conn.unreachable:
         # Requires include_destructive: a resource-lifecycle check by
         # definition creates and deletes a real resource, strictly more
         # destructive than testing a single write tool in isolation — never
-        # run implicitly just because --sequential was passed.
+        # run implicitly just because --sequential was passed. Also skipped
+        # once the server's already unreachable — nothing left to chain a
+        # lifecycle check against.
         report.sequence_results = await _run_sequence_checks(
             conn, params, tools_result.tools, timeout,
         )

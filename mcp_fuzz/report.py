@@ -195,6 +195,7 @@ class CrossResourceSummary:
 class Report:
     server_command: str
     connect_error: str | None
+    terminated_early: str | None
     tools: list[ToolReport]
     tested_count: int
     skipped_count: int
@@ -276,6 +277,7 @@ def build_report(
     return Report(
         server_command=raw.server_command,
         connect_error=raw.connect_error,
+        terminated_early=raw.terminated_early,
         tools=tool_reports,
         tested_count=tested_count,
         skipped_count=skipped_count,
@@ -449,6 +451,8 @@ def render_text(report: Report) -> str:
         return "\n".join(lines)
 
     lines.append(f"mcp-fuzz: {report.server_command}")
+    if report.terminated_early:
+        lines.append(f"WARNING: run ended early — {report.terminated_early}")
     lines.append("")
     if report.crash_resilience_percent is not None:
         lines.append(
@@ -593,6 +597,7 @@ def to_dict(report: Report) -> dict:
     return {
         "server_command": report.server_command,
         "connect_error": report.connect_error,
+        "terminated_early": report.terminated_early,
         "tested_count": report.tested_count,
         "skipped_count": report.skipped_count,
         "total_bad_input_cases": report.total_bad_input_cases,
