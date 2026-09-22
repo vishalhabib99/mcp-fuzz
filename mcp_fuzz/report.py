@@ -47,13 +47,29 @@ MIN_TOOLS_FOR_RESPONSE_SIZE_OUTLIER = 3
 # Same rough ~4-chars/token rule of thumb response_size already surfaces
 # per-tool, used here to roll every tested tool's single valid call up into
 # one whole-session total — a rough answer to "what would it cost an
-# agent's context window to call every tool here once." Deliberately
-# tokens only, never dollars: a real $ figure depends on which model is
-# actually consuming the response and that model's current per-token
-# pricing, neither of which this tool has any way to know without guessing
-# — and guessing at a number presented as a cost is worse than not
+# agent's context window to call every tool here once." Tokens are always
+# computed; a $ figure is only ever added when the caller explicitly names
+# a model via --price-model (see MODEL_INPUT_PRICE_PER_MILLION_TOKENS below)
+# — never guessed or defaulted, since a real $ figure depends on which
+# model actually consumes the response and that model's current per-token
+# pricing, and guessing at a number presented as a cost is worse than not
 # reporting one at all.
 CHARS_PER_TOKEN_ESTIMATE = 4
+
+# A tool's response becomes *input* tokens to whichever model reads it on
+# the agent's next turn, so this prices against each model's input rate —
+# not output. Anthropic first-party API list prices only (source: Claude
+# API pricing, checked 2026-09-21); deliberately small and explicit rather
+# than trying to track every provider's pricing, which drifts constantly
+# and isn't something this tool has any reliable way to keep current.
+# Real cost can differ: prompt caching, batch pricing, volume discounts,
+# and a third-party platform's own rates (Bedrock/Vertex/Foundry) are none
+# of them reflected here.
+MODEL_INPUT_PRICE_PER_MILLION_TOKENS = {
+    "claude-opus-5": 5.00,
+    "claude-sonnet-5": 2.00,
+    "claude-haiku-4-5": 1.00,
+}
 
 
 @dataclass
@@ -125,6 +141,10 @@ class TokenCostSummary:
     checked_count: int
     total_tokens_estimated: int | None
     avg_tokens_per_call: float | None
+    # Both None unless the caller passes --price-model with a name from
+    # MODEL_INPUT_PRICE_PER_MILLION_TOKENS — never computed by default.
+    price_model: str | None = None
+    estimated_cost_usd: float | None = None
 
 
 @dataclass
@@ -207,6 +227,7 @@ def build_report(
     raw: FuzzReport,
     slow_threshold_ms: float = LATENCY_ABSOLUTE_SLOW_MS,
     bloat_threshold_chars: int = RESPONSE_SIZE_ABSOLUTE_CHARS,
+    price_model: str | None = None,
 ) -> Report:
     tool_reports: list[ToolReport] = []
     total_bad_input = 0
@@ -265,7 +286,7 @@ def build_report(
         grade=grade,
         latency=_compute_latency(tool_reports, slow_threshold_ms),
         response_size=_compute_response_size(tool_reports, bloat_threshold_chars),
-        token_cost=_compute_token_cost(tool_reports),
+        token_cost=_compute_token_cost(tool_reports, price_model=price_model),
         concurrency=_compute_concurrency(tool_reports),
         sequence=_compute_sequence(raw.sequence_results),
         cross_resource=_compute_cross_resource(raw.cross_resource_results),
@@ -341,17 +362,23 @@ def _compute_response_size(tool_reports: list[ToolReport], bloat_threshold_chars
     )
 
 
-def _compute_token_cost(tool_reports: list[ToolReport]) -> TokenCostSummary:
+def _compute_token_cost(tool_reports: list[ToolReport], price_model: str | None = None) -> TokenCostSummary:
     sized = [t.valid_call_response_chars for t in tool_reports if t.valid_call_response_chars is not None]
     if not sized:
         return TokenCostSummary(checked_count=0, total_tokens_estimated=None, avg_tokens_per_call=None)
 
     total_chars = sum(sized)
     total_tokens = total_chars // CHARS_PER_TOKEN_ESTIMATE
+    estimated_cost_usd = None
+    if price_model is not None:
+        price_per_million = MODEL_INPUT_PRICE_PER_MILLION_TOKENS[price_model]
+        estimated_cost_usd = total_tokens * price_per_million / 1_000_000
     return TokenCostSummary(
         checked_count=len(sized),
         total_tokens_estimated=total_tokens,
         avg_tokens_per_call=total_tokens / len(sized),
+        price_model=price_model,
+        estimated_cost_usd=estimated_cost_usd,
     )
 
 
@@ -455,10 +482,16 @@ def render_text(report: Report) -> str:
 
     tc = report.token_cost
     if tc.total_tokens_estimated is not None:
+        cost_suffix = ", not a real tokenizer — see README"
+        if tc.estimated_cost_usd is not None:
+            cost_suffix = (
+                f" (~${tc.estimated_cost_usd:,.4f} at {tc.price_model}'s list input price — "
+                "not a real tokenizer, no caching/volume discount — see README)"
+            )
         lines.append(
             f"Estimated token cost: ~{tc.total_tokens_estimated:,} tokens total across {tc.checked_count} tool(s) "
-            f"(~{tc.avg_tokens_per_call:,.0f} avg/call) — one call per tool, ~4 chars/token rule of thumb, "
-            "not a real tokenizer or dollar figure — see README"
+            f"(~{tc.avg_tokens_per_call:,.0f} avg/call) — one call per tool, ~4 chars/token rule of thumb"
+            f"{cost_suffix}"
         )
 
     conc = report.concurrency
@@ -591,6 +624,8 @@ def to_dict(report: Report) -> dict:
             "checked_count": report.token_cost.checked_count,
             "total_tokens_estimated": report.token_cost.total_tokens_estimated,
             "avg_tokens_per_call": report.token_cost.avg_tokens_per_call,
+            "price_model": report.token_cost.price_model,
+            "estimated_cost_usd": report.token_cost.estimated_cost_usd,
         },
         "concurrency": {
             "concurrency": report.concurrency.concurrency,

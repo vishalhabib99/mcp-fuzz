@@ -95,10 +95,27 @@ mcp-fuzz --fail-under-response-size 90 -- python server.py
 The response size check above flags individual outliers; this rolls the same ~4-chars/token estimate up into one whole-session number — a rough answer to "what would it cost an agent's context window to call every tested tool here once." Always computed, no flag needed: it's a pure rollup of data the response size check already gathers, not a new call against the server.
 
 ```
-Estimated token cost: ~5,412 tokens total across 12 tool(s) (~451 avg/call) — one call per tool, ~4 chars/token rule of thumb, not a real tokenizer or dollar figure
+Estimated token cost: ~5,412 tokens total across 12 tool(s) (~451 avg/call) — one call per tool, ~4 chars/token rule of thumb, not a real tokenizer
 ```
 
-Deliberately **tokens only, never dollars**: a real dollar figure depends on which model is actually consuming the response and that model's current per-token pricing — neither of which this tool has any way to know without guessing, and a guessed number presented as a cost is worse than no number at all. Same crash/timeout exclusion as latency and response size: a call with no real response has nothing to count.
+**Tokens by default, never dollars — unless you explicitly ask.** A real dollar figure depends on which model is actually consuming the response and that model's current per-token pricing, neither of which this tool can know on its own, and a guessed number presented as a cost is worse than no number at all. Pass `--price-model <name>` to opt in to a dollar estimate against a small, fixed list of currently-supported models:
+
+```
+mcp-fuzz --price-model claude-sonnet-5 -- python server.py
+```
+```
+Estimated token cost: ~5,412 tokens total across 12 tool(s) (~451 avg/call) — one call per tool, ~4 chars/token rule of thumb (~$0.0108 at claude-sonnet-5's list input price — not a real tokenizer, no caching/volume discount — see README)
+```
+
+An unrecognized model name is a clean CLI error listing the supported names — never a silent guess or a fallback to some other model's price. Supported models and Anthropic's first-party list **input** price per 1M tokens (checked 2026-09-21 — a tool's response becomes *input* tokens for whichever model reads it on the agent's next turn, so this prices against the input rate, not output):
+
+| Model | Input $/1M tokens |
+|---|---|
+| `claude-opus-5` | $5.00 |
+| `claude-sonnet-5` | $2.00 |
+| `claude-haiku-4-5` | $1.00 |
+
+Deliberately narrow and static rather than trying to track every provider's pricing (which drifts constantly and this tool has no reliable way to keep current): Anthropic first-party API rates only, no caching discount, no volume discount, no Bedrock/Vertex AI/Microsoft Foundry rates (those platforms set their own). Same crash/timeout exclusion as latency and response size: a call with no real response has nothing to count.
 
 ## Runtime gate — the same two checks, live during a real agent session
 

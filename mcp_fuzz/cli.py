@@ -8,6 +8,7 @@ import sys
 from mcp_fuzz.engine import DEFAULT_TIMEOUT_SECONDS, run_fuzz
 from mcp_fuzz.report import (
     LATENCY_ABSOLUTE_SLOW_MS,
+    MODEL_INPUT_PRICE_PER_MILLION_TOKENS,
     RESPONSE_SIZE_ABSOLUTE_CHARS,
     build_report,
     render_text,
@@ -92,6 +93,14 @@ def main() -> None:
         "and deletes real data. Off by default; see README before turning this on.",
     )
     parser.add_argument(
+        "--price-model", choices=sorted(MODEL_INPUT_PRICE_PER_MILLION_TOKENS), default=None,
+        help="also convert the token-cost estimate to a dollar figure, using this model's "
+        "Anthropic first-party list *input* price (a tool's response becomes input tokens on "
+        "the agent's next turn). Off by default — never guessed, and never any provider/model "
+        "not in this fixed list. Ignores caching, volume discounts, and third-party platform "
+        "pricing (Bedrock/Vertex/Foundry) — see README.",
+    )
+    parser.add_argument(
         "--full-trace", metavar="PATH", default=None,
         help="also write every call's full detail (tool, case, arguments, outcome, "
         "timing — not just crashes/timeouts) as JSONL to PATH, for feeding a real "
@@ -125,6 +134,7 @@ def main() -> None:
     ))
     report = build_report(
         raw, slow_threshold_ms=args.slow_threshold_ms, bloat_threshold_chars=args.bloat_threshold_chars,
+        price_model=args.price_model,
     )
 
     if args.full_trace:

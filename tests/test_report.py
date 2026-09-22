@@ -18,6 +18,7 @@ from mcp_fuzz.engine import CallOutcome, run_fuzz
 from mcp_fuzz.report import (
     CHARS_PER_TOKEN_ESTIMATE,
     LATENCY_ABSOLUTE_SLOW_MS,
+    MODEL_INPUT_PRICE_PER_MILLION_TOKENS,
     RESPONSE_SIZE_ABSOLUTE_CHARS,
     ToolReport,
     _compute_concurrency,
@@ -173,6 +174,33 @@ def test_token_cost_excludes_crashed_or_timed_out_calls_from_total():
     summary = _compute_token_cost(tools)
     assert summary.checked_count == 1
     assert summary.total_tokens_estimated == 400 // CHARS_PER_TOKEN_ESTIMATE
+
+
+def test_token_cost_has_no_dollar_figure_by_default():
+    tools = [_sized_tool("a", 400)]
+    summary = _compute_token_cost(tools)
+    assert summary.price_model is None
+    assert summary.estimated_cost_usd is None
+
+
+def test_token_cost_dollar_figure_uses_named_models_input_price():
+    tools = [_sized_tool("a", 4_000_000)]  # 1,000,000 tokens at the 4-chars/token estimate
+    summary = _compute_token_cost(tools, price_model="claude-sonnet-5")
+    assert summary.price_model == "claude-sonnet-5"
+    assert summary.estimated_cost_usd == pytest.approx(MODEL_INPUT_PRICE_PER_MILLION_TOKENS["claude-sonnet-5"])
+
+
+def test_token_cost_dollar_figure_differs_by_model_at_same_token_count():
+    tools = [_sized_tool("a", 4_000_000)]
+    opus = _compute_token_cost(tools, price_model="claude-opus-5")
+    haiku = _compute_token_cost(tools, price_model="claude-haiku-4-5")
+    assert opus.estimated_cost_usd > haiku.estimated_cost_usd
+
+
+def test_unknown_price_model_raises_rather_than_silently_guessing():
+    tools = [_sized_tool("a", 400)]
+    with pytest.raises(KeyError):
+        _compute_token_cost(tools, price_model="gpt-6")
 
 
 @pytest.fixture(scope="module")
