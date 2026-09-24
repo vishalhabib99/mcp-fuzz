@@ -75,7 +75,7 @@ Want this alongside mcp-doctor's static checks and mcp-reality-check's output-fi
 Every call was always timed internally (see Full-fidelity trace export below) — this surfaces that timing as a real, scored part of the report instead of leaving it buried in an opt-in export. For each tested tool's **valid** call (the one call that does real work, unlike a bad-input call that's typically rejected before any real work happens), mcp-fuzz flags a tool as slow when either is true:
 
 - it takes longer than an absolute threshold (default 5000ms, override with `--slow-threshold-ms`), or
-- it's a clear outlier relative to this same server's other tools — more than 3x the server's own median (only checked once there are at least 3 comparably-tested tools; calling one thing an "outlier" against a sample of one or two isn't a fair comparison).
+- it's a clear outlier relative to this same server's other tools — more than 3x the server's own median **and** over 100ms (only checked once there are at least 3 comparably-tested tools; calling one thing an "outlier" against a sample of one or two isn't a fair comparison). The 100ms floor exists because on a fast server the ratio alone flags noise: before it was added, a 2.7ms `echo` on the reference `server-everything` counted as "slow" for being 3.1x a 0.9ms median, and 8 of 10 latency flags across a 10-server run were sub-25ms calls like that.
 
 A tool whose valid call crashed or timed out is excluded from the latency check entirely, not counted as merely "slow" — that failure is already the crash-resilience score's job to report, and its duration is contaminated by reconnect/timeout overhead rather than real service time anyway.
 
@@ -91,7 +91,7 @@ mcp-fuzz --fail-under-latency 90 -- python server.py
 Same two-signal design as latency, applied to response size instead of response time: a tool that dumps an unusually large payload burns an agent's context window for no reason an agent can see coming from the tool's own description. For each tested tool's **valid** call, mcp-fuzz flags a tool as bloated when either is true:
 
 - its response is longer than an absolute threshold (default 20,000 characters, roughly 5,000 tokens on the common ~4-chars/token rule of thumb for English text — a cheap estimate stated as such, not real tokenization; override with `--bloat-threshold-chars`), or
-- it's a clear outlier relative to this same server's other tools — more than 3x the server's own median response length (same minimum-sample-size guard as latency).
+- it's a clear outlier relative to this same server's other tools — more than 3x the server's own median response length **and** over 1,000 characters (~250 est. tokens) (same minimum-sample-size guard and same reasoning for the floor as latency).
 
 Same crash/timeout exclusion as latency, for the same reason: no real response to measure the size of.
 

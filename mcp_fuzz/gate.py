@@ -31,10 +31,12 @@ DEFAULT_TIMEOUT_SECONDS = 15.0
 LATENCY_ABSOLUTE_SLOW_MS = 5000.0
 LATENCY_OUTLIER_MULTIPLIER = 3.0
 MIN_CALLS_FOR_LATENCY_OUTLIER = 3
+LATENCY_OUTLIER_MIN_MS = 100.0  # see report.py: a relative outlier must also cross this floor
 
 RESPONSE_SIZE_ABSOLUTE_CHARS = 20000
 RESPONSE_SIZE_OUTLIER_MULTIPLIER = 3.0
 MIN_CALLS_FOR_RESPONSE_SIZE_OUTLIER = 3
+RESPONSE_SIZE_OUTLIER_MIN_CHARS = 1000
 
 
 def _median(values: list[float]) -> float:
@@ -78,16 +80,20 @@ class LatencyGate:
         slow_threshold_ms: float = LATENCY_ABSOLUTE_SLOW_MS,
         latency_outlier_multiplier: float = LATENCY_OUTLIER_MULTIPLIER,
         min_calls_for_latency_outlier: int = MIN_CALLS_FOR_LATENCY_OUTLIER,
+        latency_outlier_min_ms: float = LATENCY_OUTLIER_MIN_MS,
         bloat_threshold_chars: int = RESPONSE_SIZE_ABSOLUTE_CHARS,
         size_outlier_multiplier: float = RESPONSE_SIZE_OUTLIER_MULTIPLIER,
         min_calls_for_size_outlier: int = MIN_CALLS_FOR_RESPONSE_SIZE_OUTLIER,
+        size_outlier_min_chars: int = RESPONSE_SIZE_OUTLIER_MIN_CHARS,
     ):
         self.slow_threshold_ms = slow_threshold_ms
         self.latency_outlier_multiplier = latency_outlier_multiplier
         self.min_calls_for_latency_outlier = min_calls_for_latency_outlier
+        self.latency_outlier_min_ms = latency_outlier_min_ms
         self.bloat_threshold_chars = bloat_threshold_chars
         self.size_outlier_multiplier = size_outlier_multiplier
         self.min_calls_for_size_outlier = min_calls_for_size_outlier
+        self.size_outlier_min_chars = size_outlier_min_chars
         self._durations: dict[str, list[float]] = {}
         self._sizes: dict[str, list[int]] = {}
 
@@ -101,7 +107,7 @@ class LatencyGate:
             )
         if len(history_d) >= self.min_calls_for_latency_outlier:
             median = _median(history_d)
-            if median > 0 and duration_ms > self.latency_outlier_multiplier * median:
+            if median > 0 and duration_ms > max(self.latency_outlier_multiplier * median, self.latency_outlier_min_ms):
                 result.slow_reasons.append(
                     f"{duration_ms / median:.1f}x this tool's own median so far ({median:.0f}ms, {len(history_d)} prior calls)"
                 )
@@ -115,7 +121,7 @@ class LatencyGate:
             )
         if len(history_s) >= self.min_calls_for_size_outlier:
             median = _median(history_s)
-            if median > 0 and response_chars > self.size_outlier_multiplier * median:
+            if median > 0 and response_chars > max(self.size_outlier_multiplier * median, self.size_outlier_min_chars):
                 result.bloated_reasons.append(
                     f"{response_chars / median:.1f}x this tool's own median so far ({median:.0f} chars, {len(history_s)} prior calls)"
                 )

@@ -75,6 +75,14 @@ def test_relative_outlier_flagged_among_otherwise_fast_tools():
     assert "median" in summary.slow_tools[0].reasons[0]
 
 
+def test_sub_floor_relative_outlier_not_flagged_on_a_fast_server():
+    # Real case from server-everything: a 0.9ms median made a 2.7ms `echo`
+    # and two ~24ms tools "3x+ outliers". None of that is slow to an agent.
+    tools = [_tool("a", 0.8), _tool("b", 0.9), _tool("c", 0.9), _tool("echo", 2.7), _tool("links", 23.6)]
+    summary = _compute_latency(tools, LATENCY_ABSOLUTE_SLOW_MS)
+    assert summary.slow_tools == []
+
+
 def test_no_relative_outlier_check_below_minimum_sample_size():
     # Only 2 tools — not enough to fairly call either one an "outlier",
     # even though one is 10x the other. Neither should be flagged.
@@ -125,6 +133,13 @@ def test_relative_size_outlier_flagged_among_otherwise_small_tools():
     summary = _compute_response_size(tools, RESPONSE_SIZE_ABSOLUTE_CHARS)
     assert [f.name for f in summary.bloated_tools] == ["outlier"]
     assert "median" in summary.bloated_tools[0].reasons[0]
+
+
+def test_sub_floor_relative_size_outlier_not_flagged():
+    # 5x a tiny median, but ~100 est. tokens: not bloat.
+    tools = [_sized_tool("a", 60), _sized_tool("b", 64), _sized_tool("c", 70), _sized_tool("chatty", 400)]
+    summary = _compute_response_size(tools, RESPONSE_SIZE_ABSOLUTE_CHARS)
+    assert summary.bloated_tools == []
 
 
 def test_no_relative_size_outlier_check_below_minimum_sample_size():

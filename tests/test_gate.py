@@ -52,6 +52,14 @@ def test_a_different_tools_history_does_not_affect_this_ones_outlier_check():
     assert result.flagged is False
 
 
+def test_sub_floor_relative_outlier_not_flagged_in_live_session():
+    gate = LatencyGate(slow_threshold_ms=999999.0)
+    for _ in range(3):
+        gate.record("tool_a", duration_ms=1.0, response_chars=50)
+    result = gate.record("tool_a", duration_ms=5.0, response_chars=300)
+    assert result.flagged is False
+
+
 def test_no_relative_outlier_check_below_minimum_sample_size():
     gate = LatencyGate(slow_threshold_ms=999999.0, min_calls_for_latency_outlier=3)
     gate.record("tool_a", duration_ms=100.0, response_chars=10)
@@ -70,7 +78,7 @@ def test_relative_size_outlier_flagged_against_the_same_tools_own_history():
     gate = LatencyGate(bloat_threshold_chars=999999999)  # isolate the relative signal
     for _ in range(3):
         gate.record("tool_a", duration_ms=10.0, response_chars=100)
-    result = gate.record("tool_a", duration_ms=10.0, response_chars=1000)
+    result = gate.record("tool_a", duration_ms=10.0, response_chars=2000)
     assert result.flagged is True
     assert any("own median" in r for r in result.bloated_reasons)
 

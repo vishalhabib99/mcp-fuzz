@@ -32,6 +32,11 @@ BAD_INPUT_CASES = {"missing_required", "wrong_type"}
 LATENCY_ABSOLUTE_SLOW_MS = 5000.0
 LATENCY_OUTLIER_MULTIPLIER = 3.0
 MIN_TOOLS_FOR_RELATIVE_OUTLIER = 3
+# The relative check alone flags noise on fast servers: against a 0.9ms
+# median, a 2.7ms call is "3x" but nobody would call it slow. A relative
+# outlier also has to cross this floor before it counts — well below
+# anything an agent would feel, so it only removes sub-perceptible noise.
+LATENCY_OUTLIER_MIN_MS = 100.0
 
 # Same two-signal design as latency, applied to response size instead of
 # response time: a tool that dumps an unusually large payload burns an
@@ -43,6 +48,10 @@ MIN_TOOLS_FOR_RELATIVE_OUTLIER = 3
 RESPONSE_SIZE_ABSOLUTE_CHARS = 20000
 RESPONSE_SIZE_OUTLIER_MULTIPLIER = 3.0
 MIN_TOOLS_FOR_RESPONSE_SIZE_OUTLIER = 3
+# Same floor idea as LATENCY_OUTLIER_MIN_MS: against a 64-char median, a
+# 300-char reply is "4x" but costs an agent ~75 tokens. A relative outlier
+# has to be at least this big (~250 est. tokens) before it counts as bloat.
+RESPONSE_SIZE_OUTLIER_MIN_CHARS = 1000
 
 # Same rough ~4-chars/token rule of thumb response_size already surfaces
 # per-tool, used here to roll every tested tool's single valid call up into
@@ -325,7 +334,7 @@ def _compute_latency(tool_reports: list[ToolReport], slow_threshold_ms: float) -
         reasons = []
         if duration > slow_threshold_ms:
             reasons.append(f"{duration:.0f}ms, over the {slow_threshold_ms:.0f}ms absolute threshold")
-        if enough_for_relative and duration > LATENCY_OUTLIER_MULTIPLIER * median:
+        if enough_for_relative and duration > max(LATENCY_OUTLIER_MULTIPLIER * median, LATENCY_OUTLIER_MIN_MS):
             reasons.append(f"{duration / median:.1f}x this server's median ({median:.0f}ms)")
         if reasons:
             slow_tools.append(LatencyFlag(name=name, duration_ms=duration, reasons=reasons))
@@ -352,7 +361,7 @@ def _compute_response_size(tool_reports: list[ToolReport], bloat_threshold_chars
                 f"{chars:,} chars (~{chars // CHARS_PER_TOKEN_ESTIMATE:,} est. tokens), "
                 f"over the {bloat_threshold_chars:,}-char absolute threshold"
             )
-        if enough_for_relative and chars > RESPONSE_SIZE_OUTLIER_MULTIPLIER * median:
+        if enough_for_relative and chars > max(RESPONSE_SIZE_OUTLIER_MULTIPLIER * median, RESPONSE_SIZE_OUTLIER_MIN_CHARS):
             reasons.append(f"{chars / median:.1f}x this server's median ({median:.0f} chars)")
         if reasons:
             bloated_tools.append(ResponseSizeFlag(name=name, response_chars=chars, reasons=reasons))
